@@ -1,0 +1,558 @@
+package com.example.ui
+
+import android.os.Build
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Layers
+import androidx.compose.material.icons.outlined.NotificationsActive
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.example.R
+import com.example.data.OverlayRuntimeState
+import com.example.data.ServiceStatus
+import com.example.engine.AdaptiveRoiConfig
+import com.example.engine.SolverMode
+import com.example.ui.theme.AmberPop
+import com.example.ui.theme.AmberPopContainer
+import com.example.ui.theme.CoralPulse
+import com.example.ui.theme.ElectricCobalt
+import com.example.ui.theme.MintSurge
+import com.example.ui.theme.MintSurgeContainer
+import com.example.ui.theme.OnMintSurge
+
+@Composable
+fun LaunchpadScreen(
+    runtime: OverlayRuntimeState,
+    permissions: PermissionState,
+    roiConfig: AdaptiveRoiConfig,
+    onRequestOverlayPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onSelectSolverMode: (SolverMode) -> Unit,
+    onLaunchOverlay: () -> Unit,
+    onTogglePause: () -> Unit,
+    onStopOverlay: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isRunning = runtime.status != ServiceStatus.STOPPED
+    val scrollState = rememberScrollState()
+
+    val statusColor by animateColorAsState(
+        targetValue = when (runtime.status) {
+            ServiceStatus.GUIDING -> MintSurge
+            ServiceStatus.SEARCHING -> ElectricCobalt
+            ServiceStatus.PAUSED -> AmberPop
+            ServiceStatus.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        label = "status_color"
+    )
+
+    val statusText = when (runtime.status) {
+        ServiceStatus.STOPPED -> stringResource(R.string.status_stopped)
+        ServiceStatus.SEARCHING -> stringResource(R.string.status_searching)
+        ServiceStatus.PAUSED -> stringResource(R.string.status_paused)
+        ServiceStatus.GUIDING -> stringResource(R.string.status_guiding)
+    }
+
+    val pulseTransition = rememberInfiniteTransition(label = "hero_pulse")
+    val pulseAlpha by pulseTransition.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1100, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "hero_pulse_alpha"
+    )
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState)
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
+    ) {
+        // Expressive Hero Surface with layered gradient atmosphere
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("hero_status_card"),
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            border = BorderStroke(1.dp, statusColor.copy(alpha = if (isRunning) 0.55f else 0.18f))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(
+                                statusColor.copy(alpha = if (isRunning) 0.18f else 0.08f),
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.06f),
+                                Color.Transparent
+                            )
+                        )
+                    )
+                    .padding(22.dp)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = statusColor.copy(alpha = 0.16f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(9.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            statusColor.copy(
+                                                alpha = if (isRunning) pulseAlpha else 0.7f
+                                            )
+                                        )
+                                )
+                                Text(
+                                    text = statusText,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = statusColor
+                                )
+                            }
+                        }
+
+                        if (runtime.detectedThemeRgb != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(runtime.detectedThemeRgb))
+                                )
+                                Text(
+                                    text = "Theme Locked",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = stringResource(R.string.hero_title),
+                            style = MaterialTheme.typography.headlineLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = stringResource(R.string.hero_subtitle),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // Active Move Telemetry Strip
+                    val rec = runtime.recommendation
+                    if (isRunning && rec != null) {
+                        Surface(
+                            shape = MaterialTheme.shapes.medium,
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(
+                                        text = "Slot ${rec.slotIndex + 1} • ${rec.piece.label}",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MintSurge
+                                    )
+                                    Text(
+                                        text = "Row ${rec.targetRow + 1}, Col ${rec.targetCol + 1} • ${rec.solveTimeMs} ms",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(50),
+                                    color = MintSurgeContainer
+                                ) {
+                                    Text(
+                                        text = "${(rec.monteCarloSurvivalRate * 100).toInt()}% Safe",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MintSurge,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Primary Expressive Action Pill(s)
+        if (!isRunning) {
+            Button(
+                onClick = onLaunchOverlay,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(62.dp)
+                    .testTag("launch_overlay_button"),
+                shape = RoundedCornerShape(50),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MintSurge,
+                    contentColor = OnMintSurge
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.AutoAwesome,
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = stringResource(R.string.btn_launch_overlay),
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                FilledTonalButton(
+                    onClick = onTogglePause,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp)
+                        .testTag("home_toggle_pause_button"),
+                    shape = RoundedCornerShape(50)
+                ) {
+                    val paused = runtime.status == ServiceStatus.PAUSED
+                    Icon(
+                        imageVector = if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
+                        contentDescription = null
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(if (paused) R.string.action_resume else R.string.action_pause),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+
+                Button(
+                    onClick = onStopOverlay,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp)
+                        .testTag("stop_overlay_button"),
+                    shape = RoundedCornerShape(50),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CoralPulse,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Stop,
+                        contentDescription = null
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.btn_stop_overlay),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
+        }
+
+        // Permissions Section
+        Text(
+            text = "System Readiness",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            PermissionReadinessCard(
+                icon = Icons.Outlined.Layers,
+                title = stringResource(R.string.perm_overlay_title),
+                description = stringResource(R.string.perm_overlay_desc),
+                isGranted = permissions.hasOverlayPermission,
+                onGrant = onRequestOverlayPermission,
+                testTag = "perm_overlay_card"
+            )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                PermissionReadinessCard(
+                    icon = Icons.Outlined.NotificationsActive,
+                    title = stringResource(R.string.perm_notif_title),
+                    description = stringResource(R.string.perm_notif_desc),
+                    isGranted = permissions.hasNotificationPermission,
+                    onGrant = onRequestNotificationPermission,
+                    testTag = "perm_notif_card"
+                )
+            }
+        }
+
+        // Solver Strategy Picker (Moved cleanly into companion app so floating pill stays minimalist)
+        Text(
+            text = stringResource(R.string.strategy_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            StrategyOptionCard(
+                title = stringResource(R.string.strategy_balanced),
+                subtitle = stringResource(R.string.strategy_balanced_desc),
+                icon = Icons.Rounded.Shield,
+                accentColor = MintSurge,
+                selected = roiConfig.solverMode == SolverMode.BALANCED_SURVIVAL,
+                onClick = { onSelectSolverMode(SolverMode.BALANCED_SURVIVAL) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("strategy_balanced_card")
+            )
+
+            StrategyOptionCard(
+                title = stringResource(R.string.strategy_combo),
+                subtitle = stringResource(R.string.strategy_combo_desc),
+                icon = Icons.Rounded.Bolt,
+                accentColor = AmberPop,
+                selected = roiConfig.solverMode == SolverMode.COMBO_MAXIMIZER,
+                onClick = { onSelectSolverMode(SolverMode.COMBO_MAXIMIZER) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("strategy_combo_card")
+            )
+        }
+
+        // Quick Android 15+ compliance tip
+        Surface(
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.GridView,
+                    contentDescription = null,
+                    tint = ElectricCobalt
+                )
+                Text(
+                    text = "Only the single next best move highlights on screen. Full 3-piece turn lookahead runs invisibly to keep your board unobstructed.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun PermissionReadinessCard(
+    icon: ImageVector,
+    title: String,
+    description: String,
+    isGranted: Boolean,
+    onGrant: () -> Unit,
+    testTag: String
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(testTag),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = if (isGranted) MintSurgeContainer else MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(44.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = if (isGranted) MintSurge else MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (isGranted) {
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = MintSurgeContainer
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.CheckCircle,
+                            contentDescription = null,
+                            tint = MintSurge,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.perm_granted),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MintSurge
+                        )
+                    }
+                }
+            } else {
+                OutlinedButton(
+                    onClick = onGrant,
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(stringResource(R.string.perm_grant_cta))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StrategyOptionCard(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    accentColor: Color,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = MaterialTheme.shapes.medium,
+        color = if (selected) {
+            if (accentColor == AmberPop) AmberPopContainer.copy(alpha = 0.55f)
+            else MintSurgeContainer.copy(alpha = 0.65f)
+        } else {
+            MaterialTheme.colorScheme.surfaceContainer
+        },
+        border = BorderStroke(
+            width = if (selected) 2.dp else 1.dp,
+            color = if (selected) accentColor else MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (selected) accentColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp)
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}

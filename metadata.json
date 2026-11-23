@@ -1,0 +1,6 @@
+{
+  "name": "BlockBlast Tactician",
+  "description": "Real-time Android 15+ Material 3 Expressive overlay solver for Block Blast Lite with adaptive theme vision and 64-bit lookahead.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
