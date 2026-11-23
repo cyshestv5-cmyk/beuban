@@ -56,6 +56,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.engine.OperatingMode
 import com.example.ui.CalibrateScreen
 import com.example.ui.LaunchpadScreen
 import com.example.ui.MainViewModel
@@ -121,7 +122,7 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
         vm.refreshPermissions()
         if (!granted) {
             scope.launch {
-                snackbarHostState.showSnackbar("Notification permission helps keep the overlay active.")
+                snackbarHostState.showSnackbar("Notification permission helps keep the capture service active.")
             }
         }
     }
@@ -131,6 +132,12 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
             Uri.parse("package:${context.packageName}")
         ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    }
+
+    fun openAccessibilitySettings() {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
     }
 
@@ -151,6 +158,30 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
             mgr.createScreenCaptureIntent()
         }
         projectionLauncher.launch(captureIntent)
+    }
+
+    fun launchEngineFlow() {
+        vm.refreshPermissions()
+        val currentPerms = vm.permissions.value
+
+        if (roiConfig.operatingMode == OperatingMode.AUTOPLAY && !currentPerms.hasAccessibilityPermission) {
+            scope.launch {
+                snackbarHostState.showSnackbar("Enable Accessibility Autoplay first so Tactician can drag pieces.")
+            }
+            openAccessibilitySettings()
+            return
+        }
+
+        // Prefer zero-popup Accessibility capture on Android 11-15+ whenever connected
+        if (vm.tryStartAccessibilitySession()) {
+            scope.launch {
+                snackbarHostState.showSnackbar("Engine active via Android Accessibility — switch to Block Blast Lite!")
+            }
+            return
+        }
+
+        // Automatic fallback to MediaProjection (Android 8-10 or when Accessibility isn't active)
+        launchProjectionFlow()
     }
 
     val navBackStack by navController.currentBackStackEntryAsState()
@@ -245,14 +276,18 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
                         runtime = runtime,
                         permissions = permissions,
                         roiConfig = roiConfig,
+                        onRequestAccessibilityPermission = ::openAccessibilitySettings,
                         onRequestOverlayPermission = ::openOverlaySettings,
                         onRequestNotificationPermission = {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             }
                         },
+                        onSelectOperatingMode = vm::setOperatingMode,
                         onSelectSolverMode = vm::setSolverMode,
-                        onLaunchOverlay = ::launchProjectionFlow,
+                        onSelectThinkingDepth = vm::setThinkingDepth,
+                        onLaunchOverlay = ::launchEngineFlow,
+                        onLaunchProjectionFallback = ::launchProjectionFlow,
                         onTogglePause = vm::togglePauseCaptureService,
                         onStopOverlay = vm::stopCaptureService
                     )
@@ -263,6 +298,7 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
                         onUpdateGridBounds = vm::updateGridBounds,
                         onUpdateTrayBounds = vm::updateTrayBounds,
                         onUpdateOpacity = vm::updateOverlayOpacity,
+                        onUpdateDragLift = vm::updateDragLiftOffset,
                         onResetDefaults = vm::resetRoiDefaults
                     )
                 }

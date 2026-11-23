@@ -2,16 +2,21 @@ package com.example
 
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.AdaptiveScreenParser
+import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
+import com.example.engine.DropVerificationResult
 import com.example.engine.IntArrayPixelFrame
+import com.example.engine.MoveRecommendation
 import com.example.engine.ParsedFrame
 import com.example.engine.PieceCatalog
 import com.example.engine.SolverMode
+import com.example.engine.ThinkingDepth
 import com.example.engine.TraySlotState
 import java.io.File
 import javax.imageio.ImageIO
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -319,5 +324,100 @@ class VisionAndSolverTest {
         assertEquals(rec.slotIndex, recAfter?.slotIndex)
         assertEquals(rec.targetRow, recAfter?.targetRow)
         assertEquals(rec.targetCol, recAfter?.targetCol)
+    }
+
+    @Test
+    fun `ultra deep solver respects 250ms budget and avoids bisecting bulky 3x3 territory`() {
+        // Board has an open 4x4 sanctuary in top-right (rows 0..3, cols 4..7); placing 2x2 cleanly in
+        // bottom-left leaves sq_3x3 alive, whereas placing in center kills all 3x3 slots!
+        val rows = listOf(
+            "####....",
+            "####....",
+            "####....",
+            "####....",
+            "........",
+            "........",
+            "###..###",
+            "###..###"
+        )
+        var board = 0L
+        for (r in 0 until 8) {
+            for (c in 0 until 8) {
+                if (rows[r][c] == '#') board = board or (1L shl (r * 8 + c))
+            }
+        }
+        val tray = listOf(
+            TraySlotState.Recognized(0, PieceCatalog.BY_ID.getValue("sq_2x2")),
+            TraySlotState.Recognized(1, PieceCatalog.BY_ID.getValue("bar_1x3")),
+            TraySlotState.Recognized(2, PieceCatalog.BY_ID.getValue("dot_1x1"))
+        )
+        val rec = BitboardSolver.solve(
+            boardMask = board,
+            tray = tray,
+            mode = SolverMode.BALANCED_SURVIVAL,
+            depth = ThinkingDepth.ULTRA_DEEP
+        )
+        assertNotNull(rec)
+        assertTrue("Ultra-deep solve should respect 250ms ceiling (took ${rec!!.solveTimeMs}ms)", rec.solveTimeMs <= 350L)
+        assertTrue("Bulky capacity should remain positive on resulting end-board", rec.bulkyCapacityScore > 0)
+    }
+
+    @Test
+    fun `autoplay move verifier detects exact hit, drifted lift row, new turn spawn, and failed drop`() {
+        val sq2x2 = PieceCatalog.BY_ID.getValue("sq_2x2")
+        val bar1x3 = PieceCatalog.BY_ID.getValue("bar_1x3")
+        val preBoard = 0L
+        val preTray = listOf(
+            TraySlotState.Recognized(0, sq2x2),
+            TraySlotState.Recognized(1, bar1x3),
+            TraySlotState.Empty
+        )
+        val rec = MoveRecommendation(
+            slotIndex = 0,
+            piece = sq2x2,
+            targetRow = 4,
+            targetCol = 3,
+            linesCleared = 0,
+            fullPlan = emptyList(),
+            survivabilityScore = 100f,
+            bulkyCapacityScore = 10,
+            monteCarloSurvivalRate = 1f,
+            solveTimeMs = 12L
+        )
+
+        // 1) Exact drop -> Verified(null)
+        val exactBoard = sq2x2.maskAt(4, 3)
+        val clearedSlotTray = listOf(TraySlotState.Empty, TraySlotState.Recognized(1, bar1x3), TraySlotState.Empty)
+        val exactVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, exactBoard, clearedSlotTray)
+        assertTrue(exactVerdict is DropVerificationResult.Verified)
+        assertNull((exactVerdict as DropVerificationResult.Verified).liftOffsetCorrectionCells)
+
+        // 2) Landed 1 row higher (row 3 instead of 4) -> suggests positive lift offset adjustment
+        val driftedHighBoard = sq2x2.maskAt(3, 3)
+        val driftedVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, driftedHighBoard, clearedSlotTray)
+        assertTrue(driftedVerdict is DropVerificationResult.Verified)
+        val corr = (driftedVerdict as DropVerificationResult.Verified).liftOffsetCorrectionCells
+        assertNotNull(corr)
+        assertTrue("Expected positive downward touch compensation, got $corr", corr!! > 0.5f)
+
+        // 3) Piece still in tray slot -> NotApplied
+        val missVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, preBoard, preTray)
+        assertTrue(missVerdict is DropVerificationResult.NotApplied)
+
+        // 4) Last piece spawns fresh 3-piece turn -> NewTurnSpawned
+        val lastPieceTray = listOf(TraySlotState.Empty, TraySlotState.Empty, TraySlotState.Recognized(2, sq2x2))
+        val newTurnTray = listOf(
+            TraySlotState.Recognized(0, sq2x2),
+            TraySlotState.Recognized(1, bar1x3),
+            TraySlotState.Recognized(2, sq2x2)
+        )
+        val spawnVerdict = AutoplayMoveVerifier.verifyDrop(
+            preBoard,
+            lastPieceTray,
+            rec.copy(slotIndex = 2),
+            sq2x2.maskAt(4, 3),
+            newTurnTray
+        )
+        assertTrue(spawnVerdict is DropVerificationResult.NewTurnSpawned)
     }
 }

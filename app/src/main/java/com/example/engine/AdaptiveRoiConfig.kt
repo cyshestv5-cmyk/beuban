@@ -1,8 +1,18 @@
 package com.example.engine
 
+enum class OperatingMode(val label: String) {
+    GUIDE_OVERLAY("Guide Overlay"),
+    AUTOPLAY("Autoplay")
+}
+
 enum class SolverMode(val label: String) {
     BALANCED_SURVIVAL("Balanced Survival"),
     COMBO_MAXIMIZER("Combo Maximizer")
+}
+
+enum class ThinkingDepth(val label: String, val budgetMs: Long) {
+    BALANCED_FAST("Balanced (~45 ms)", 45L),
+    ULTRA_DEEP("Ultra-Deep Max Survival (250 ms)", 240L)
 }
 
 /**
@@ -19,8 +29,15 @@ data class AdaptiveRoiConfig(
     val trayLeftMargin: Float = 0.045f,
     val trayRightMargin: Float = 0.955f,
     val expectedMiniTileWidthFraction: Float = 0.048f,
+    val operatingMode: OperatingMode = OperatingMode.GUIDE_OVERLAY,
     val solverMode: SolverMode = SolverMode.BALANCED_SURVIVAL,
-    val overlayOpacity: Float = 0.88f
+    val thinkingDepth: ThinkingDepth = ThinkingDepth.ULTRA_DEEP,
+    val overlayOpacity: Float = 0.88f,
+    /**
+     * Vertical touch offset (in board cell heights) applied during Accessibility Autoplay drags
+     * to compensate for Block Blast Lite lifting a dragged block slightly above the user's finger.
+     */
+    val dragLiftOffsetCells: Float = 1.0f
 ) {
     fun cellWidth(): Float = (gridRight - gridLeft) / 8f
     fun cellHeight(): Float = (gridBottom - gridTop) / 8f

@@ -326,7 +326,9 @@ fun FloatingControlPill(
     TacticianTheme(darkTheme = true) {
         val isPaused = status == ServiceStatus.PAUSED
         val indicatorColor = when (status) {
-            ServiceStatus.GUIDING -> MintSurge
+            ServiceStatus.GUIDING, ServiceStatus.DRAGGING -> MintSurge
+            ServiceStatus.VERIFYING -> MintSurge.copy(alpha = 0.7f)
+            ServiceStatus.THINKING -> Color(0xFF7B9DFF)
             ServiceStatus.SEARCHING -> Color(0xFF4D8DFF)
             ServiceStatus.PAUSED -> AmberPop
             ServiceStatus.STOPPED -> CoralPulse

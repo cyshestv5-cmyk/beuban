@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AccessibilityNew
 import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.rounded.AutoAwesome
@@ -34,8 +35,12 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
@@ -57,10 +62,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.CaptureSource
 import com.example.data.OverlayRuntimeState
 import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
+import com.example.engine.OperatingMode
 import com.example.engine.SolverMode
+import com.example.engine.ThinkingDepth
 import com.example.ui.theme.AmberPop
 import com.example.ui.theme.AmberPopContainer
 import com.example.ui.theme.CoralPulse
@@ -74,20 +82,26 @@ fun LaunchpadScreen(
     runtime: OverlayRuntimeState,
     permissions: PermissionState,
     roiConfig: AdaptiveRoiConfig,
+    onRequestAccessibilityPermission: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onSelectOperatingMode: (OperatingMode) -> Unit,
     onSelectSolverMode: (SolverMode) -> Unit,
+    onSelectThinkingDepth: (ThinkingDepth) -> Unit,
     onLaunchOverlay: () -> Unit,
+    onLaunchProjectionFallback: () -> Unit,
     onTogglePause: () -> Unit,
     onStopOverlay: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isRunning = runtime.status != ServiceStatus.STOPPED
+    val isAutoplay = roiConfig.operatingMode == OperatingMode.AUTOPLAY
     val scrollState = rememberScrollState()
 
     val statusColor by animateColorAsState(
         targetValue = when (runtime.status) {
-            ServiceStatus.GUIDING -> MintSurge
+            ServiceStatus.GUIDING, ServiceStatus.DRAGGING, ServiceStatus.VERIFYING -> MintSurge
+            ServiceStatus.THINKING -> Color(0xFF7B9DFF)
             ServiceStatus.SEARCHING -> ElectricCobalt
             ServiceStatus.PAUSED -> AmberPop
             ServiceStatus.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -98,8 +112,11 @@ fun LaunchpadScreen(
     val statusText = when (runtime.status) {
         ServiceStatus.STOPPED -> stringResource(R.string.status_stopped)
         ServiceStatus.SEARCHING -> stringResource(R.string.status_searching)
+        ServiceStatus.THINKING -> stringResource(R.string.status_thinking)
         ServiceStatus.PAUSED -> stringResource(R.string.status_paused)
         ServiceStatus.GUIDING -> stringResource(R.string.status_guiding)
+        ServiceStatus.DRAGGING -> stringResource(R.string.status_dragging)
+        ServiceStatus.VERIFYING -> stringResource(R.string.status_verifying)
     }
 
     val pulseTransition = rememberInfiniteTransition(label = "hero_pulse")
@@ -120,7 +137,7 @@ fun LaunchpadScreen(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        // Expressive Hero Surface with layered gradient atmosphere
+        // Expressive Hero Surface with live engine telemetry
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -176,7 +193,19 @@ fun LaunchpadScreen(
                             }
                         }
 
-                        if (runtime.detectedThemeRgb != null) {
+                        if (isRunning && runtime.captureSource != CaptureSource.NONE) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh
+                            ) {
+                                Text(
+                                    text = runtime.captureSource.label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        } else if (runtime.detectedThemeRgb != null) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -209,6 +238,22 @@ fun LaunchpadScreen(
                         )
                     }
 
+                    if (!runtime.noticeMessage.isNullOrBlank()) {
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = AmberPopContainer.copy(alpha = 0.55f)
+                        ) {
+                            Text(
+                                text = runtime.noticeMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = AmberPop,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                        }
+                    }
+
                     // Active Move Telemetry Strip
                     val rec = runtime.recommendation
                     if (isRunning && rec != null) {
@@ -229,8 +274,13 @@ fun LaunchpadScreen(
                                         style = MaterialTheme.typography.titleMedium,
                                         color = MintSurge
                                     )
+                                    val movesNote = if (runtime.autoplayMovesCount > 0) {
+                                        " • ${runtime.autoplayMovesCount} auto-placed"
+                                    } else {
+                                        ""
+                                    }
                                     Text(
-                                        text = "Row ${rec.targetRow + 1}, Col ${rec.targetCol + 1} • ${rec.solveTimeMs} ms",
+                                        text = "Row ${rec.targetRow + 1}, Col ${rec.targetCol + 1} • ${rec.solveTimeMs} ms$movesNote",
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -255,28 +305,49 @@ fun LaunchpadScreen(
 
         // Primary Expressive Action Pill(s)
         if (!isRunning) {
-            Button(
-                onClick = onLaunchOverlay,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(62.dp)
-                    .testTag("launch_overlay_button"),
-                shape = RoundedCornerShape(50),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MintSurge,
-                    contentColor = OnMintSurge
-                )
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.AutoAwesome,
-                    contentDescription = null,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    text = stringResource(R.string.btn_launch_overlay),
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onLaunchOverlay,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(62.dp)
+                        .testTag("launch_overlay_button"),
+                    shape = RoundedCornerShape(50),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MintSurge,
+                        contentColor = OnMintSurge
+                    )
+                ) {
+                    Icon(
+                        imageVector = if (isAutoplay) Icons.Rounded.TouchApp else Icons.Rounded.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text = stringResource(
+                            if (isAutoplay) R.string.btn_launch_autoplay else R.string.btn_launch_overlay
+                        ),
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+
+                // Offer explicit MediaProjection fallback button if Accessibility capture is active on API 30+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && permissions.hasAccessibilityPermission) {
+                    OutlinedButton(
+                        onClick = onLaunchProjectionFallback,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("launch_projection_fallback_button"),
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            text = "Or Start via MediaProjection Stream (200 ms)",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                }
             }
         } else {
             Row(
@@ -328,7 +399,43 @@ fun LaunchpadScreen(
             }
         }
 
-        // Permissions Section
+        // Operating Mode Switcher (Guide Overlay vs Autoplay)
+        Text(
+            text = stringResource(R.string.mode_section_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OptionCard(
+                title = stringResource(R.string.mode_guide),
+                subtitle = stringResource(R.string.mode_guide_desc),
+                icon = Icons.Rounded.Visibility,
+                accentColor = ElectricCobalt,
+                selected = roiConfig.operatingMode == OperatingMode.GUIDE_OVERLAY,
+                onClick = { onSelectOperatingMode(OperatingMode.GUIDE_OVERLAY) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("mode_guide_card")
+            )
+
+            OptionCard(
+                title = stringResource(R.string.mode_autoplay),
+                subtitle = stringResource(R.string.mode_autoplay_desc),
+                icon = Icons.Rounded.TouchApp,
+                accentColor = MintSurge,
+                selected = roiConfig.operatingMode == OperatingMode.AUTOPLAY,
+                onClick = { onSelectOperatingMode(OperatingMode.AUTOPLAY) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("mode_autoplay_card")
+            )
+        }
+
+        // Permissions & System Readiness Section
         Text(
             text = "System Readiness",
             style = MaterialTheme.typography.titleMedium,
@@ -336,6 +443,29 @@ fun LaunchpadScreen(
         )
 
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            PermissionReadinessCard(
+                icon = Icons.Outlined.AccessibilityNew,
+                title = stringResource(R.string.perm_accessibility_title),
+                description = stringResource(R.string.perm_accessibility_desc),
+                isGranted = permissions.hasAccessibilityPermission,
+                onGrant = onRequestAccessibilityPermission,
+                testTag = "perm_accessibility_card"
+            )
+
+            if (!permissions.hasAccessibilityPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceContainerLow
+                ) {
+                    Text(
+                        text = stringResource(R.string.accessibility_sideload_tip),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
+
             PermissionReadinessCard(
                 icon = Icons.Outlined.Layers,
                 title = stringResource(R.string.perm_overlay_title),
@@ -357,7 +487,43 @@ fun LaunchpadScreen(
             }
         }
 
-        // Solver Strategy Picker (Moved cleanly into companion app so floating pill stays minimalist)
+        // Thinking Depth Picker
+        Text(
+            text = stringResource(R.string.depth_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OptionCard(
+                title = stringResource(R.string.depth_ultra_deep),
+                subtitle = stringResource(R.string.depth_ultra_deep_desc),
+                icon = Icons.Rounded.Psychology,
+                accentColor = MintSurge,
+                selected = roiConfig.thinkingDepth == ThinkingDepth.ULTRA_DEEP,
+                onClick = { onSelectThinkingDepth(ThinkingDepth.ULTRA_DEEP) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("depth_ultra_deep_card")
+            )
+
+            OptionCard(
+                title = stringResource(R.string.depth_balanced),
+                subtitle = stringResource(R.string.depth_balanced_desc),
+                icon = Icons.Rounded.Speed,
+                accentColor = ElectricCobalt,
+                selected = roiConfig.thinkingDepth == ThinkingDepth.BALANCED_FAST,
+                onClick = { onSelectThinkingDepth(ThinkingDepth.BALANCED_FAST) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("depth_balanced_card")
+            )
+        }
+
+        // Solver Strategy Picker
         Text(
             text = stringResource(R.string.strategy_title),
             style = MaterialTheme.typography.titleMedium,
@@ -368,7 +534,7 @@ fun LaunchpadScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            StrategyOptionCard(
+            OptionCard(
                 title = stringResource(R.string.strategy_balanced),
                 subtitle = stringResource(R.string.strategy_balanced_desc),
                 icon = Icons.Rounded.Shield,
@@ -380,7 +546,7 @@ fun LaunchpadScreen(
                     .testTag("strategy_balanced_card")
             )
 
-            StrategyOptionCard(
+            OptionCard(
                 title = stringResource(R.string.strategy_combo),
                 subtitle = stringResource(R.string.strategy_combo_desc),
                 icon = Icons.Rounded.Bolt,
@@ -393,7 +559,6 @@ fun LaunchpadScreen(
             )
         }
 
-        // Quick Android 15+ compliance tip
         Surface(
             shape = MaterialTheme.shapes.medium,
             color = MaterialTheme.colorScheme.surfaceContainerLow
@@ -411,7 +576,7 @@ fun LaunchpadScreen(
                     tint = ElectricCobalt
                 )
                 Text(
-                    text = "Only the single next best move highlights on screen. Full 3-piece turn lookahead runs invisibly to keep your board unobstructed.",
+                    text = "Verify-After-Drop checks every automated drag and automatically compensates vertical drag lift so pieces lock accurately into place.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -509,7 +674,7 @@ private fun PermissionReadinessCard(
 }
 
 @Composable
-private fun StrategyOptionCard(
+private fun OptionCard(
     title: String,
     subtitle: String,
     icon: ImageVector,
@@ -523,8 +688,11 @@ private fun StrategyOptionCard(
         modifier = modifier,
         shape = MaterialTheme.shapes.medium,
         color = if (selected) {
-            if (accentColor == AmberPop) AmberPopContainer.copy(alpha = 0.55f)
-            else MintSurgeContainer.copy(alpha = 0.65f)
+            when (accentColor) {
+                AmberPop -> AmberPopContainer.copy(alpha = 0.55f)
+                ElectricCobalt -> ElectricCobalt.copy(alpha = 0.16f)
+                else -> MintSurgeContainer.copy(alpha = 0.65f)
+            }
         } else {
             MaterialTheme.colorScheme.surfaceContainer
         },

@@ -1,14 +1,19 @@
 package com.example.ui
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Application
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
+import android.view.accessibility.AccessibilityManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.CaptureSource
 import com.example.data.OverlayRuntimeState
 import com.example.data.OverlayStateStore
 import com.example.data.PreferencesRepository
@@ -16,11 +21,14 @@ import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.BitboardSolver
 import com.example.engine.MoveRecommendation
+import com.example.engine.OperatingMode
 import com.example.engine.PieceCatalog
 import com.example.engine.PieceShape
 import com.example.engine.SolverMode
+import com.example.engine.ThinkingDepth
 import com.example.engine.TraySlotState
 import com.example.service.ScreenCaptureService
+import com.example.service.TacticianAccessibilityService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -32,11 +40,12 @@ import kotlinx.coroutines.launch
 
 data class PermissionState(
     val hasOverlayPermission: Boolean = false,
-    val hasNotificationPermission: Boolean = true
+    val hasNotificationPermission: Boolean = true,
+    val hasAccessibilityPermission: Boolean = false
 )
 
 data class SandboxUiState(
-    val boardMask: Long = 0x00003838000080E0L, // Sample L-shape + 3x2 block
+    val boardMask: Long = 0x00003838000080E0L,
     val selectedSlot: Int = 0,
     val trayPieces: List<PieceShape?> = listOf(
         PieceCatalog.BY_ID["l_3x2_1"],
@@ -62,6 +71,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val sandbox: StateFlow<SandboxUiState> = _sandbox.asStateFlow()
 
     init {
+        viewModelScope.launch {
+            TacticianAccessibilityService.isServiceConnected.collect {
+                refreshPermissions()
+            }
+        }
         refreshPermissions()
         solveSandbox()
     }
@@ -75,15 +89,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             true
         }
+        val hasAccessibility = isAccessibilityEnabled(ctx)
         _permissions.value = PermissionState(
             hasOverlayPermission = canOverlay,
-            hasNotificationPermission = hasNotif
+            hasNotificationPermission = hasNotif,
+            hasAccessibilityPermission = hasAccessibility
         )
+    }
+
+    private fun isAccessibilityEnabled(ctx: Context): Boolean {
+        if (TacticianAccessibilityService.isServiceConnected.value) return true
+        val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
+        val expected = ComponentName(ctx, TacticianAccessibilityService::class.java)
+        val enabled = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+        return enabled.any { info ->
+            val svc = info.resolveInfo?.serviceInfo ?: return@any false
+            svc.packageName == expected.packageName && svc.name == expected.className
+        }
+    }
+
+    fun setOperatingMode(mode: OperatingMode) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(operatingMode = mode) }
+        }
     }
 
     fun setSolverMode(mode: SolverMode) {
         viewModelScope.launch {
             prefs.updateConfig { it.copy(solverMode = mode) }
+        }
+    }
+
+    fun setThinkingDepth(depth: ThinkingDepth) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(thinkingDepth = depth) }
         }
     }
 
@@ -119,10 +158,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun updateDragLiftOffset(cells: Float) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(dragLiftOffsetCells = cells.coerceIn(-1.0f, 2.5f)) }
+        }
+    }
+
     fun resetRoiDefaults() {
         viewModelScope.launch {
             prefs.resetDefaults()
         }
+    }
+
+    /**
+     * Attempts zero-prompt Accessibility capture on Android 11-15+.
+     * Returns true if started via Accessibility, or false if caller should fall back to MediaProjection.
+     */
+    fun tryStartAccessibilitySession(): Boolean {
+        if (TacticianAccessibilityService.canTakeScreenshots()) {
+            return TacticianAccessibilityService.startNativeSession()
+        }
+        return false
     }
 
     fun startCaptureService(resultCode: Int, data: Intent) {
@@ -136,20 +192,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopCaptureService() {
+        TacticianAccessibilityService.stopNativeSession()
         val ctx = getApplication<Application>()
-        val intent = Intent(ctx, ScreenCaptureService::class.java).apply {
-            action = ScreenCaptureService.ACTION_STOP
+        if (overlayRuntime.value.captureSource == CaptureSource.MEDIA_PROJECTION) {
+            val intent = Intent(ctx, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_STOP
+            }
+            ctx.startService(intent)
         }
-        ctx.startService(intent)
     }
 
     fun togglePauseCaptureService() {
-        if (overlayRuntime.value.status == ServiceStatus.STOPPED) return
-        val ctx = getApplication<Application>()
-        val intent = Intent(ctx, ScreenCaptureService::class.java).apply {
-            action = ScreenCaptureService.ACTION_TOGGLE_PAUSE
+        val state = overlayRuntime.value
+        if (state.status == ServiceStatus.STOPPED) return
+        if (state.captureSource == CaptureSource.ACCESSIBILITY) {
+            TacticianAccessibilityService.togglePauseNativeSession()
+        } else {
+            val ctx = getApplication<Application>()
+            val intent = Intent(ctx, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_TOGGLE_PAUSE
+            }
+            ctx.startService(intent)
         }
-        ctx.startService(intent)
     }
 
     // --- Sandbox Interactions ---
@@ -187,12 +251,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun solveSandbox() {
         val current = _sandbox.value
-        val mode = roiConfig.value.solverMode
+        val cfg = roiConfig.value
         val tray = current.trayPieces.mapIndexed { idx, piece ->
             if (piece == null) TraySlotState.Empty else TraySlotState.Recognized(idx, piece)
         }
         viewModelScope.launch(Dispatchers.Default) {
-            val rec = BitboardSolver.solve(current.boardMask, tray, mode)
+            val rec = BitboardSolver.solve(current.boardMask, tray, cfg.solverMode, cfg.thinkingDepth)
             _sandbox.update { it.copy(recommendation = rec) }
         }
     }

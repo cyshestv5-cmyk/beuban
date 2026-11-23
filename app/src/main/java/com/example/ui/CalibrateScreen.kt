@@ -32,7 +32,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -43,8 +42,16 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.engine.AdaptiveRoiConfig
+import com.example.ui.theme.AmberPop
 import com.example.ui.theme.ElectricCobalt
 import com.example.ui.theme.MintSurge
+import kotlin.math.roundToInt
+
+private enum class CalibrateThemePreview(val label: String) {
+    WOOD("Wood"),
+    RED("Red"),
+    LIGHT("Light")
+}
 
 @Composable
 fun CalibrateScreen(
@@ -52,10 +59,11 @@ fun CalibrateScreen(
     onUpdateGridBounds: (leftMargin: Float, top: Float, bottom: Float) -> Unit,
     onUpdateTrayBounds: (trayTop: Float, trayHeight: Float) -> Unit,
     onUpdateOpacity: (Float) -> Unit,
+    onUpdateDragLift: (Float) -> Unit,
     onResetDefaults: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var previewWoodTheme by remember { mutableStateOf(true) }
+    var previewTheme by remember { mutableStateOf(CalibrateThemePreview.WOOD) }
     val scrollState = rememberScrollState()
 
     Column(
@@ -65,42 +73,42 @@ fun CalibrateScreen(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = stringResource(R.string.calibrate_title),
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Text(
-                    text = stringResource(R.string.calibrate_subtitle),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = stringResource(R.string.calibrate_title),
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = stringResource(R.string.calibrate_subtitle),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
-        // Theme Preview Toggle (Light vs Wood)
+        // Theme Preview Toggle (Wood vs Red vs Light)
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             FilterChip(
-                selected = previewWoodTheme,
-                onClick = { previewWoodTheme = true },
-                label = { Text("Wood Theme Preview") },
+                selected = previewTheme == CalibrateThemePreview.WOOD,
+                onClick = { previewTheme = CalibrateThemePreview.WOOD },
+                label = { Text("Wood") },
                 modifier = Modifier.testTag("preview_wood_chip")
             )
             FilterChip(
-                selected = !previewWoodTheme,
-                onClick = { previewWoodTheme = false },
-                label = { Text("Light Theme Preview") },
+                selected = previewTheme == CalibrateThemePreview.RED,
+                onClick = { previewTheme = CalibrateThemePreview.RED },
+                label = { Text("Red") },
+                modifier = Modifier.testTag("preview_red_chip")
+            )
+            FilterChip(
+                selected = previewTheme == CalibrateThemePreview.LIGHT,
+                onClick = { previewTheme = CalibrateThemePreview.LIGHT },
+                label = { Text("Light") },
                 modifier = Modifier.testTag("preview_light_chip")
             )
         }
 
-        // Visual Simulated Phone Screen with Live ROI Alignment Wireframe
+        // Visual Simulated Phone Screen with Live ROI + Drag Lift Wireframe
         Surface(
             modifier = Modifier
                 .fillMaxWidth(0.68f)
@@ -110,9 +118,21 @@ fun CalibrateScreen(
             border = BorderStroke(2.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
             shadowElevation = 8.dp
         ) {
-            val bgColor = if (previewWoodTheme) Color(0xFFC46C47) else Color(0xFFF6F8FC)
-            val boardBg = if (previewWoodTheme) Color(0xFF4B2314) else Color(0xFFFFFFFF)
-            val lineColor = if (previewWoodTheme) Color(0xFF5D2D1B) else Color(0xFFDCE2EC)
+            val bgColor = when (previewTheme) {
+                CalibrateThemePreview.WOOD -> Color(0xFFC46C47)
+                CalibrateThemePreview.RED -> Color(0xFFB9464D)
+                CalibrateThemePreview.LIGHT -> Color(0xFFF6F8FC)
+            }
+            val boardBg = when (previewTheme) {
+                CalibrateThemePreview.WOOD -> Color(0xFF4B2314)
+                CalibrateThemePreview.RED -> Color(0xFF481515)
+                CalibrateThemePreview.LIGHT -> Color(0xFFFFFFFF)
+            }
+            val lineColor = when (previewTheme) {
+                CalibrateThemePreview.WOOD -> Color(0xFF5D2D1B)
+                CalibrateThemePreview.RED -> Color(0xFF330C0C)
+                CalibrateThemePreview.LIGHT -> Color(0xFFDCE2EC)
+            }
 
             Box(
                 modifier = Modifier
@@ -123,7 +143,6 @@ fun CalibrateScreen(
                     val w = size.width
                     val h = size.height
 
-                    // Simulated game board at default Block Blast Lite aspect
                     val defLeft = 0.056f * w
                     val defRight = 0.944f * w
                     val defTop = 0.240f * h
@@ -175,6 +194,21 @@ fun CalibrateScreen(
                         }
                     }
 
+                    // Sample target cell vs Autoplay finger touch point (compensated by dragLiftOffsetCells)
+                    val sampleTarget = Offset(gLeft + 3.5f * cw, gTop + 3.5f * ch)
+                    val touchDrop = Offset(
+                        sampleTarget.x,
+                        (sampleTarget.y + config.dragLiftOffsetCells * ch).coerceIn(gTop, h - 16f)
+                    )
+                    drawLine(
+                        color = AmberPop,
+                        start = sampleTarget,
+                        end = touchDrop,
+                        strokeWidth = 3f
+                    )
+                    drawCircle(color = MintSurge, radius = 6f, center = sampleTarget)
+                    drawCircle(color = AmberPop, radius = 6f, center = touchDrop)
+
                     // Active user-calibrated 3-slot tray ROI overlay
                     for (slot in 0..2) {
                         val b = config.traySlotBounds(slot)
@@ -206,6 +240,14 @@ fun CalibrateScreen(
                 modifier = Modifier.padding(18.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                val formattedLift = ((config.dragLiftOffsetCells * 10f).roundToInt() / 10f)
+                SliderSetting(
+                    label = "Autoplay Drag Lift Offset",
+                    valueText = "${if (formattedLift >= 0f) "+" else ""}$formattedLift cells",
+                    value = config.dragLiftOffsetCells,
+                    range = -1.0f..2.5f,
+                    onValueChange = onUpdateDragLift
+                )
                 SliderSetting(
                     label = "Grid Top Edge",
                     valueText = "${(config.gridTop * 100).toInt()}%",
