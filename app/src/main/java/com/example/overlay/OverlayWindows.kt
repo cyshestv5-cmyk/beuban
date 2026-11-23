@@ -294,13 +294,14 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
                         border = BorderStroke(1.5.dp, SlateSurfaceDark.copy(alpha = 0.85f)),
                         shadowElevation = 6.dp
                     ) {
-                        val badgeLabel = if (rec.linesCleared > 0) {
-                            "▲ ${stringResource(R.string.overlay_next_badge)} • ×${rec.linesCleared}"
-                        } else {
-                            "▲ ${stringResource(R.string.overlay_next_badge)}"
+                        val streak = runtimeState.comboState.comboStreak
+                        val parts = buildList {
+                            add("▲ ${stringResource(R.string.overlay_next_badge)}")
+                            if (rec.linesCleared > 0) add("×${rec.linesCleared}")
+                            if (streak > 0) add("Streak $streak")
                         }
                         Text(
-                            text = badgeLabel,
+                            text = parts.joinToString(" • "),
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.ExtraBold),
                             color = OnMintSurge,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
@@ -328,6 +329,7 @@ fun FloatingControlPill(
         val indicatorColor = when (status) {
             ServiceStatus.GUIDING, ServiceStatus.DRAGGING -> MintSurge
             ServiceStatus.VERIFYING -> MintSurge.copy(alpha = 0.7f)
+            ServiceStatus.CALIBRATING -> AmberPop
             ServiceStatus.THINKING -> Color(0xFF7B9DFF)
             ServiceStatus.SEARCHING -> Color(0xFF4D8DFF)
             ServiceStatus.PAUSED -> AmberPop

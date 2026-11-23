@@ -14,7 +14,8 @@ enum class ServiceStatus {
     PAUSED,
     GUIDING,
     DRAGGING,
-    VERIFYING
+    VERIFYING,
+    CALIBRATING
 }
 
 enum class CaptureSource(val label: String) {
@@ -33,8 +34,11 @@ data class OverlayRuntimeState(
     val captureWidthPx: Int = 0,
     val captureHeightPx: Int = 0,
     val autoplayMovesCount: Int = 0,
+    val comboState: ComboState = ComboState(),
     val lastCalibrationSummary: String? = null,
-    val noticeMessage: String? = null
+    val noticeMessage: String? = null,
+    val pendingGuidedCalibration: Boolean = false,
+    val guidedCalibrationStep: Int = 0
 )
 
 /**
@@ -47,6 +51,38 @@ object OverlayStateStore {
 
     fun updateRoiConfig(config: AdaptiveRoiConfig) {
         _state.update { it.copy(roiConfig = config) }
+    }
+
+    fun requestGuidedCalibration(requested: Boolean) {
+        _state.update {
+            it.copy(
+                pendingGuidedCalibration = requested,
+                guidedCalibrationStep = if (!requested) 0 else it.guidedCalibrationStep
+            )
+        }
+    }
+
+    fun setCalibratingStep(step: Int, notice: String? = null) {
+        _state.update { current ->
+            if (current.status == ServiceStatus.STOPPED) return@update current
+            current.copy(
+                status = ServiceStatus.CALIBRATING,
+                guidedCalibrationStep = step,
+                noticeMessage = notice ?: current.noticeMessage
+            )
+        }
+    }
+
+    fun finishGuidedCalibration(summary: String) {
+        _state.update { current ->
+            current.copy(
+                pendingGuidedCalibration = false,
+                guidedCalibrationStep = 0,
+                status = if (current.status == ServiceStatus.CALIBRATING) ServiceStatus.SEARCHING else current.status,
+                lastCalibrationSummary = summary,
+                noticeMessage = summary
+            )
+        }
     }
 
     fun setServiceStarted(
@@ -62,6 +98,8 @@ object OverlayStateStore {
                 captureWidthPx = widthPx,
                 captureHeightPx = heightPx,
                 autoplayMovesCount = 0,
+                comboState = ComboTracker.reset(),
+                guidedCalibrationStep = 0,
                 noticeMessage = null
             )
         }
@@ -73,6 +111,7 @@ object OverlayStateStore {
             current.copy(
                 status = if (paused) ServiceStatus.PAUSED else ServiceStatus.SEARCHING,
                 recommendation = if (paused) null else current.recommendation,
+                guidedCalibrationStep = 0,
                 noticeMessage = notice
             )
         }
@@ -133,12 +172,23 @@ object OverlayStateStore {
         }
     }
 
-    fun recordVerifiedMove(calibrationSummary: String? = null) {
+    fun recordVerifiedMove(calibrationSummary: String? = null, linesCleared: Int = 0) {
         _state.update { current ->
             current.copy(
                 autoplayMovesCount = current.autoplayMovesCount + 1,
+                comboState = ComboTracker.onPlacementCleared(current.comboState, linesCleared),
                 lastCalibrationSummary = calibrationSummary ?: current.lastCalibrationSummary
             )
+        }
+    }
+
+    fun resetComboOnNewGame() {
+        _state.update { current ->
+            if (current.comboState.comboStreak == 0 && current.comboState.placementsSinceClear == 0) {
+                current
+            } else {
+                current.copy(comboState = ComboTracker.reset())
+            }
         }
     }
 
@@ -169,6 +219,8 @@ object OverlayStateStore {
                 captureSource = CaptureSource.NONE,
                 recommendation = null,
                 detectedThemeRgb = null,
+                guidedCalibrationStep = 0,
+                pendingGuidedCalibration = false,
                 noticeMessage = null
             )
         }

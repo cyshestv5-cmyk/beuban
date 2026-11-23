@@ -20,6 +20,7 @@ import com.example.data.PreferencesRepository
 import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.BitboardSolver
+import com.example.engine.GlobalProfile
 import com.example.engine.MoveRecommendation
 import com.example.engine.OperatingMode
 import com.example.engine.PieceCatalog
@@ -114,6 +115,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setGlobalProfile(profile: GlobalProfile) {
+        viewModelScope.launch {
+            val depth = if (profile == GlobalProfile.FASTEST_SPEED) {
+                ThinkingDepth.BALANCED_FAST
+            } else {
+                ThinkingDepth.ULTRA_DEEP
+            }
+            prefs.updateConfig {
+                it.copy(
+                    globalProfile = profile,
+                    solverMode = profile.solverMode,
+                    thinkingDepth = depth
+                )
+            }
+        }
+    }
+
     fun setSolverMode(mode: SolverMode) {
         viewModelScope.launch {
             prefs.updateConfig { it.copy(solverMode = mode) }
@@ -166,8 +184,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateDragVerticalGain(gain: Float) {
         viewModelScope.launch {
-            prefs.updateConfig { it.copy(dragVerticalGain = gain.coerceIn(0.75f, 1.95f)) }
+            prefs.updateConfig { it.copy(dragVerticalGain = gain.coerceIn(0.65f, 1.95f)) }
         }
+    }
+
+    fun updateDragHorizontalOffset(cells: Float) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(dragHorizontalOffsetCells = cells.coerceIn(-2.5f, 2.5f)) }
+        }
+    }
+
+    fun updateDragHorizontalGain(gain: Float) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(dragHorizontalGain = gain.coerceIn(0.65f, 1.45f)) }
+        }
+    }
+
+    fun armGuidedCalibration(): Boolean {
+        val armed = !overlayRuntime.value.pendingGuidedCalibration
+        OverlayStateStore.requestGuidedCalibration(armed)
+        return armed
     }
 
     fun resetRoiDefaults() {
@@ -262,7 +298,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (piece == null) TraySlotState.Empty else TraySlotState.Recognized(idx, piece)
         }
         viewModelScope.launch(Dispatchers.Default) {
-            val rec = BitboardSolver.solve(current.boardMask, tray, cfg.solverMode, cfg.thinkingDepth)
+            val rec = BitboardSolver.solve(
+                boardMask = current.boardMask,
+                tray = tray,
+                mode = cfg.globalProfile.solverMode,
+                profile = cfg.globalProfile
+            )
             _sandbox.update { it.copy(recommendation = rec) }
         }
     }

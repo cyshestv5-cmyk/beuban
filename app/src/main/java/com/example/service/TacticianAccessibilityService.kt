@@ -9,6 +9,7 @@ import android.graphics.Path
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.WindowManager
@@ -29,6 +30,8 @@ import com.example.engine.MoveRecommendation
 import com.example.engine.OperatingMode
 import com.example.engine.ParsedFrame
 import com.example.engine.PixelFrame
+import com.example.engine.PreviewCalibrationSample
+import com.example.engine.PreviewHoverDetector
 import com.example.engine.TraySlotState
 import com.example.overlay.OverlayWindowHost
 import java.util.concurrent.Executors
@@ -51,14 +54,19 @@ import kotlinx.coroutines.withContext
 
 /**
  * Android 15+ compliant AccessibilityService powering:
- * 1. Smooth multi-segment GestureDescription piece dragging for Autoplay with persisted gain/lift compensation.
- * 2. Zero-prompt AccessibilityService.takeScreenshot() board reading on Android 11-15+
- *    with seamless fallback signaling to MediaProjection when unsupported or restricted.
- * 3. Live screen-size board/tray auto-detection and closed-loop Verify-After-Drop LMS calibration
- *    persisted in app private storage.
+ * 1. Hold-open multi-segment GestureDescription piece dragging for Autoplay + live Preview-Snap correction.
+ * 2. Non-destructive Guided 3-Point Preview Calibration solving 4-parameter affine screen/game kinematics.
+ * 3. Zero-prompt AccessibilityService.takeScreenshot() board reading on Android 11-15+
+ *    with automatic fallback signaling to MediaProjection when unsupported or restricted.
  */
 @SuppressLint("AccessibilityPolicy")
 class TacticianAccessibilityService : AccessibilityService() {
+
+    class ActiveHoldDrag internal constructor(
+        internal var currentStroke: GestureDescription.StrokeDescription,
+        internal var currentX: Float,
+        internal var currentY: Float
+    )
 
     companion object {
         private val _isConnected = MutableStateFlow(false)
@@ -87,11 +95,6 @@ class TacticianAccessibilityService : AccessibilityService() {
             OverlayStateStore.setPaused(state.status != ServiceStatus.PAUSED)
         }
 
-        /**
-         * Dispatches a smooth human-paced drag from tray slot center to target cell center
-         * using the device's calibrated gain and finger-lift compensation.
-         * Callable from both Accessibility capture loop and MediaProjection fallback service.
-         */
         suspend fun executeAutoplayDrag(
             config: AdaptiveRoiConfig,
             rec: MoveRecommendation,
@@ -101,13 +104,54 @@ class TacticianAccessibilityService : AccessibilityService() {
             val svc = activeInstance ?: return false
             return svc.performPieceDrag(config, rec, screenW, screenH)
         }
+
+        suspend fun beginHoldDrag(
+            startX: Float,
+            startY: Float,
+            toX: Float,
+            toY: Float,
+            pressMs: Long,
+            glideMs: Long
+        ): ActiveHoldDrag? {
+            val svc = activeInstance ?: return null
+            return svc.performBeginHoldDrag(startX, startY, toX, toY, pressMs, glideMs)
+        }
+
+        suspend fun nudgeHoldDrag(
+            handle: ActiveHoldDrag,
+            toX: Float,
+            toY: Float,
+            durationMs: Long
+        ): Boolean {
+            val svc = activeInstance ?: return false
+            return svc.performNudgeHoldDrag(handle, toX, toY, durationMs)
+        }
+
+        suspend fun releaseHoldDrag(
+            handle: ActiveHoldDrag,
+            settleMs: Long
+        ): Boolean {
+            val svc = activeInstance ?: return false
+            return svc.performReleaseHoldDrag(handle, settleMs)
+        }
     }
 
     private sealed interface CaptureAttempt {
-        data class Frame(val pixelFrame: PixelFrame, val width: Int, val height: Int) : CaptureAttempt
+        data class Frame(
+            val pixelFrame: PixelFrame,
+            val width: Int,
+            val height: Int,
+            val capturedAtMs: Long
+        ) : CaptureAttempt
+
         data object Throttled : CaptureAttempt
         data object UnsupportedOrError : CaptureAttempt
     }
+
+    private data class SettledBoardResult(
+        val activeBoard: ParsedFrame.ActiveBoard,
+        val frame: CaptureAttempt.Frame
+    )
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -138,7 +182,7 @@ class TacticianAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Frame-driven vision pipeline does not depend on noisy UI node trees.
+        // Frame-driven vision pipeline does not depend on UI node trees.
     }
 
     override fun onInterrupt() {
@@ -196,246 +240,528 @@ class TacticianAccessibilityService : AccessibilityService() {
             var consecutiveErrors = 0
             var failedDropStreak = 0
             var hasVerifiedLayoutForSession = false
+            var carryoverFrame: CaptureAttempt.Frame? = null
+            var carryoverParsed: ParsedFrame.ActiveBoard? = null
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
                 if (state.status == ServiceStatus.PAUSED || state.status == ServiceStatus.STOPPED) {
+                    carryoverFrame = null
+                    carryoverParsed = null
                     delay(350L)
                     continue
                 }
 
-                when (val cap = captureFrameViaAccessibility()) {
-                    is CaptureAttempt.Throttled -> {
-                        delay(420L)
-                        continue
-                    }
-                    is CaptureAttempt.UnsupportedOrError -> {
-                        consecutiveErrors++
-                        if (consecutiveErrors >= 3) {
-                            OverlayStateStore.setNotice(
-                                "Accessibility screenshot unavailable — switch to MediaProjection fallback."
-                            )
-                            OverlayStateStore.setPaused(true)
-                            delay(500L)
-                        } else {
-                            delay(450L)
-                        }
-                        continue
-                    }
-                    is CaptureAttempt.Frame -> {
-                        consecutiveErrors = 0
-                        updateDisplayMetrics()
+                val currentFrame: CaptureAttempt.Frame
+                var preParsedBoard: ParsedFrame? = null
 
-                        var activeConfig = state.roiConfig
-                        var parsed = parser.parse(
-                            frame = cap.pixelFrame,
-                            width = cap.width,
-                            height = cap.height,
-                            config = activeConfig,
+                if (carryoverFrame != null && carryoverParsed != null) {
+                    currentFrame = carryoverFrame
+                    preParsedBoard = carryoverParsed
+                    carryoverFrame = null
+                    carryoverParsed = null
+                } else {
+                    when (val cap = captureFrameViaAccessibility()) {
+                        is CaptureAttempt.Throttled -> {
+                            delay(340L)
+                            continue
+                        }
+                        is CaptureAttempt.UnsupportedOrError -> {
+                            consecutiveErrors++
+                            if (consecutiveErrors >= 3) {
+                                OverlayStateStore.setNotice(
+                                    "Accessibility screenshot unavailable — switch to MediaProjection fallback."
+                                )
+                                OverlayStateStore.setPaused(true)
+                                delay(500L)
+                            } else {
+                                delay(380L)
+                            }
+                            continue
+                        }
+                        is CaptureAttempt.Frame -> {
+                            consecutiveErrors = 0
+                            currentFrame = cap
+                        }
+                    }
+                }
+
+                updateDisplayMetrics()
+                var activeConfig = state.roiConfig
+                var parsed = preParsedBoard ?: parser.parse(
+                    frame = currentFrame.pixelFrame,
+                    width = currentFrame.width,
+                    height = currentFrame.height,
+                    config = activeConfig,
+                    requireStability = true
+                )
+
+                val screenChanged =
+                    activeConfig.calibratedScreenWidthPx != screenWidthPx ||
+                        activeConfig.calibratedScreenHeightPx != screenHeightPx
+                val needsAutoLayout =
+                    screenChanged || (!hasVerifiedLayoutForSession && parsed is ParsedFrame.IdleOrMenu)
+
+                if (needsAutoLayout) {
+                    val detected = withContext(Dispatchers.Default) {
+                        AutoLayoutCalibrator.detectBoardAndTrayLayout(
+                            frame = currentFrame.pixelFrame,
+                            width = currentFrame.width,
+                            height = currentFrame.height,
+                            baseConfig = activeConfig,
+                            fullScreenWidthPx = screenWidthPx,
+                            fullScreenHeightPx = screenHeightPx
+                        )
+                    }
+                    if (detected != null) {
+                        activeConfig = detected
+                        hasVerifiedLayoutForSession = true
+                        OverlayStateStore.updateRoiConfig(detected)
+                        persistLayoutCalibration(detected)
+                        parser.resetStability()
+                        parsed = parser.parse(
+                            frame = currentFrame.pixelFrame,
+                            width = currentFrame.width,
+                            height = currentFrame.height,
+                            config = detected,
                             requireStability = true
                         )
+                    }
+                } else if (parsed is ParsedFrame.ActiveBoard) {
+                    hasVerifiedLayoutForSession = true
+                }
 
-                        val screenChanged =
-                            activeConfig.calibratedScreenWidthPx != screenWidthPx ||
-                                activeConfig.calibratedScreenHeightPx != screenHeightPx
-                        val needsAutoLayout =
-                            screenChanged || (!hasVerifiedLayoutForSession && parsed is ParsedFrame.IdleOrMenu)
+                when (parsed) {
+                    is ParsedFrame.IdleOrMenu -> {
+                        consecutiveIdleFrames++
+                        if (lockedRec == null || consecutiveIdleFrames >= 3) {
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedConfig = null
+                            lockedRec = null
+                            lockedActive = null
+                            failedDropStreak = 0
+                            OverlayStateStore.resetComboOnNewGame()
+                            OverlayStateStore.setSearching()
+                        }
+                        delay(420L)
+                    }
+                    is ParsedFrame.Animating -> {
+                        consecutiveIdleFrames = 0
+                        delay(340L)
+                    }
+                    is ParsedFrame.ActiveBoard -> {
+                        consecutiveIdleFrames = 0
 
-                        if (needsAutoLayout) {
-                            val detected = withContext(Dispatchers.Default) {
-                                AutoLayoutCalibrator.detectBoardAndTrayLayout(
-                                    frame = cap.pixelFrame,
-                                    width = cap.width,
-                                    height = cap.height,
-                                    baseConfig = activeConfig,
-                                    fullScreenWidthPx = screenWidthPx,
-                                    fullScreenHeightPx = screenHeightPx
-                                )
-                            }
-                            if (detected != null) {
-                                activeConfig = detected
-                                hasVerifiedLayoutForSession = true
-                                OverlayStateStore.updateRoiConfig(detected)
-                                persistLayoutCalibration(detected)
-                                parser.resetStability()
-                                parsed = parser.parse(
-                                    frame = cap.pixelFrame,
-                                    width = cap.width,
-                                    height = cap.height,
-                                    config = detected,
-                                    requireStability = true
-                                )
-                            }
-                        } else if (parsed is ParsedFrame.ActiveBoard) {
-                            hasVerifiedLayoutForSession = true
+                        // Check if user triggered Guided 3-Point Preview Calibration
+                        if (OverlayStateStore.state.value.pendingGuidedCalibration) {
+                            runGuidedPreviewCalibration(activeConfig, currentFrame, parsed)
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedRec = null
+                            lockedActive = null
+                            parser.resetStability()
+                            delay(220L)
+                            continue
                         }
 
-                        when (parsed) {
-                            is ParsedFrame.IdleOrMenu -> {
-                                consecutiveIdleFrames++
-                                if (lockedRec == null || consecutiveIdleFrames >= 3) {
-                                    lockedBoardMask = -1L
-                                    lockedTraySig = ""
-                                    lockedConfig = null
-                                    lockedRec = null
-                                    lockedActive = null
-                                    failedDropStreak = 0
-                                    OverlayStateStore.setSearching()
-                                }
-                                delay(450L)
-                            }
-                            is ParsedFrame.Animating -> {
-                                consecutiveIdleFrames = 0
-                                delay(360L)
-                            }
-                            is ParsedFrame.ActiveBoard -> {
-                                consecutiveIdleFrames = 0
-                                val traySig = traySignature(parsed.tray)
+                        val traySig = traySignature(parsed.tray)
+                        val profile = activeConfig.globalProfile
 
-                                val isSameBoard = lockedRec != null &&
-                                    parsed.boardMask == lockedBoardMask &&
-                                    traySig == lockedTraySig &&
-                                    activeConfig == lockedConfig
+                        val isSameBoard = lockedRec != null &&
+                            lockedConfig != null &&
+                            parsed.boardMask == lockedBoardMask &&
+                            traySig == lockedTraySig &&
+                            activeConfig.globalProfile == lockedConfig.globalProfile &&
+                            activeConfig.solverMode == lockedConfig.solverMode &&
+                            activeConfig.gridTop == lockedConfig.gridTop
 
-                                val recToUse: MoveRecommendation? = if (isSameBoard) {
-                                    lockedRec
-                                } else {
-                                    OverlayStateStore.setThinking(parsed.boardMask, parsed.emptyCellColorRgb)
-                                    val solved = withContext(Dispatchers.Default) {
-                                        BitboardSolver.solve(
-                                            boardMask = parsed.boardMask,
-                                            tray = parsed.tray,
-                                            mode = activeConfig.solverMode,
-                                            depth = activeConfig.thinkingDepth
-                                        )
+                        val recToUse: MoveRecommendation? = if (isSameBoard) {
+                            lockedRec
+                        } else {
+                            OverlayStateStore.setThinking(parsed.boardMask, parsed.emptyCellColorRgb)
+                            val combo = OverlayStateStore.state.value.comboState
+                            val solved = withContext(Dispatchers.Default) {
+                                BitboardSolver.solve(
+                                    boardMask = parsed.boardMask,
+                                    tray = parsed.tray,
+                                    mode = profile.solverMode,
+                                    profile = profile,
+                                    comboStreak = combo.comboStreak,
+                                    placementsSinceClear = combo.placementsSinceClear
+                                )
+                            }
+                            lockedBoardMask = parsed.boardMask
+                            lockedTraySig = traySig
+                            lockedConfig = activeConfig
+                            lockedRec = solved
+                            lockedActive = parsed
+                            OverlayStateStore.updateGuidance(
+                                boardMask = parsed.boardMask,
+                                themeRgb = parsed.emptyCellColorRgb,
+                                recommendation = solved
+                            )
+                            solved
+                        }
+
+                        val currentState = OverlayStateStore.state.value
+                        if (currentState.roiConfig.operatingMode == OperatingMode.AUTOPLAY &&
+                            recToUse != null &&
+                            currentState.status != ServiceStatus.PAUSED &&
+                            currentState.status != ServiceStatus.STOPPED
+                        ) {
+                            if (profile.preDragPreviewMs > 0L) {
+                                delay(profile.preDragPreviewMs)
+                            }
+                            if (OverlayStateStore.state.value.status == ServiceStatus.PAUSED ||
+                                OverlayStateStore.state.value.status == ServiceStatus.STOPPED
+                            ) {
+                                continue
+                            }
+
+                            OverlayStateStore.setDragging(recToUse)
+                            var dragConfig = OverlayStateStore.state.value.roiConfig
+                            val useLiveSnap = profile.enableLivePreviewSnap || !dragConfig.isPreviewLocked
+
+                            val dragOk = if (useLiveSnap) {
+                                performLivePreviewSnapDrop(
+                                    config = dragConfig,
+                                    rec = recToUse,
+                                    preFrame = currentFrame,
+                                    preBoardMask = parsed.boardMask,
+                                    onConfigRefined = { refined ->
+                                        dragConfig = refined
+                                        OverlayStateStore.updateRoiConfig(refined)
+                                        persistMovementCalibration(refined)
                                     }
-                                    lockedBoardMask = parsed.boardMask
-                                    lockedTraySig = traySig
-                                    lockedConfig = activeConfig
-                                    lockedRec = solved
-                                    lockedActive = parsed
-                                    OverlayStateStore.updateGuidance(
-                                        boardMask = parsed.boardMask,
-                                        themeRgb = parsed.emptyCellColorRgb,
-                                        recommendation = solved
+                                )
+                            } else {
+                                performPieceDrag(
+                                    config = dragConfig,
+                                    rec = recToUse,
+                                    screenW = screenWidthPx,
+                                    screenH = screenHeightPx
+                                )
+                            }
+
+                            if (!dragOk) {
+                                failedDropStreak++
+                                if (failedDropStreak >= 3) {
+                                    OverlayStateStore.setPaused(
+                                        true,
+                                        "Autoplay paused — touch gesture was interrupted."
                                     )
-                                    solved
                                 }
+                                delay(380L)
+                                continue
+                            }
 
-                                val currentState = OverlayStateStore.state.value
-                                if (currentState.roiConfig.operatingMode == OperatingMode.AUTOPLAY &&
-                                    recToUse != null &&
-                                    currentState.status != ServiceStatus.PAUSED &&
-                                    currentState.status != ServiceStatus.STOPPED
-                                ) {
-                                    // Brief visual preview before executing gesture
-                                    delay(140L)
-                                    if (OverlayStateStore.state.value.status == ServiceStatus.PAUSED ||
-                                        OverlayStateStore.state.value.status == ServiceStatus.STOPPED
-                                    ) {
-                                        continue
-                                    }
+                            // Verify-After-Drop closed-loop check + post-drop frame carryover
+                            OverlayStateStore.setVerifying()
+                            delay(profile.postDropWaitMs)
+                            parser.resetStability()
 
-                                    OverlayStateStore.setDragging(recToUse)
-                                    val dragConfig = OverlayStateStore.state.value.roiConfig
-                                    val dragOk = performPieceDrag(
+                            val settled = awaitSettledPostDropBoard(dragConfig)
+                            val preActive = lockedActive
+                            if (settled != null && preActive != null) {
+                                when (
+                                    val verdict = AutoplayMoveVerifier.verifyDrop(
                                         config = dragConfig,
-                                        rec = recToUse,
-                                        screenW = screenWidthPx,
-                                        screenH = screenHeightPx
+                                        screenWidthPx = screenWidthPx,
+                                        screenHeightPx = screenHeightPx,
+                                        preBoardMask = preActive.boardMask,
+                                        preTray = preActive.tray,
+                                        executed = recToUse,
+                                        postBoardMask = settled.activeBoard.boardMask,
+                                        postTray = settled.activeBoard.tray
                                     )
-
-                                    if (!dragOk) {
+                                ) {
+                                    is DropVerificationResult.Verified -> {
+                                        failedDropStreak = 0
+                                        val calUpdate = verdict.calibrationUpdate
+                                        if (calUpdate != null) {
+                                            OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
+                                            persistMovementCalibration(calUpdate.updatedConfig)
+                                            OverlayStateStore.recordVerifiedMove(
+                                                calibrationSummary = calUpdate.summary,
+                                                linesCleared = verdict.linesCleared
+                                            )
+                                        } else {
+                                            OverlayStateStore.recordVerifiedMove(
+                                                calibrationSummary = null,
+                                                linesCleared = verdict.linesCleared
+                                            )
+                                        }
+                                        // Carry settled frame straight into next solve cycle (0ms wait!)
+                                        carryoverFrame = settled.frame
+                                        carryoverParsed = settled.activeBoard
+                                    }
+                                    is DropVerificationResult.NewTurnSpawned -> {
+                                        failedDropStreak = 0
+                                        OverlayStateStore.recordVerifiedMove(
+                                            calibrationSummary = null,
+                                            linesCleared = verdict.linesCleared
+                                        )
+                                        carryoverFrame = settled.frame
+                                        carryoverParsed = settled.activeBoard
+                                    }
+                                    is DropVerificationResult.NotApplied -> {
                                         failedDropStreak++
-                                        if (failedDropStreak >= 3) {
+                                        val recovered = AutoplayMoveVerifier.recoverFromFailedDrop(
+                                            dragConfig,
+                                            recToUse
+                                        )
+                                        OverlayStateStore.updateRoiConfig(recovered)
+                                        persistMovementCalibration(recovered)
+                                        val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
+                                        if (failedDropStreak >= maxFailures) {
                                             OverlayStateStore.setPaused(
                                                 true,
-                                                "Autoplay paused — touch gesture was interrupted."
+                                                "Autoplay paused — run Guided 3-Point Calibration in Calibrate."
                                             )
                                         }
-                                        delay(420L)
-                                        continue
                                     }
-
-                                    // Verify-After-Drop closed-loop check + real-time calibration
-                                    OverlayStateStore.setVerifying()
-                                    delay(300L)
-                                    parser.resetStability()
-
-                                    val postFrame = awaitSettledPostDropBoard(dragConfig)
-                                    val preActive = lockedActive
-                                    if (postFrame != null && preActive != null) {
-                                        when (
-                                            val verdict = AutoplayMoveVerifier.verifyDrop(
-                                                config = dragConfig,
-                                                screenWidthPx = screenWidthPx,
-                                                screenHeightPx = screenHeightPx,
-                                                preBoardMask = preActive.boardMask,
-                                                preTray = preActive.tray,
-                                                executed = recToUse,
-                                                postBoardMask = postFrame.boardMask,
-                                                postTray = postFrame.tray
-                                            )
-                                        ) {
-                                            is DropVerificationResult.Verified -> {
-                                                failedDropStreak = 0
-                                                val calUpdate = verdict.calibrationUpdate
-                                                if (calUpdate != null) {
-                                                    OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
-                                                    persistMovementCalibration(calUpdate.updatedConfig)
-                                                    OverlayStateStore.recordVerifiedMove(calUpdate.summary)
-                                                } else {
-                                                    OverlayStateStore.recordVerifiedMove(null)
-                                                }
-                                                lockedBoardMask = -1L
-                                                lockedTraySig = ""
-                                                lockedRec = null
-                                                lockedActive = null
-                                            }
-                                            is DropVerificationResult.NewTurnSpawned -> {
-                                                failedDropStreak = 0
-                                                OverlayStateStore.recordVerifiedMove(null)
-                                                lockedBoardMask = -1L
-                                                lockedTraySig = ""
-                                                lockedRec = null
-                                                lockedActive = null
-                                            }
-                                            is DropVerificationResult.NotApplied -> {
-                                                failedDropStreak++
-                                                val recovered = AutoplayMoveVerifier.recoverFromFailedDrop(
-                                                    dragConfig,
-                                                    recToUse
-                                                )
-                                                OverlayStateStore.updateRoiConfig(recovered)
-                                                persistMovementCalibration(recovered)
-                                                lockedBoardMask = -1L
-                                                lockedTraySig = ""
-                                                lockedRec = null
-                                                lockedActive = null
-                                                val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
-                                                if (failedDropStreak >= maxFailures) {
-                                                    OverlayStateStore.setPaused(
-                                                        true,
-                                                        "Autoplay paused — drop did not register. Adjust Drag Lift or Gain in Calibrate."
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // Force fresh re-parse next cycle
-                                        lockedBoardMask = -1L
-                                        lockedTraySig = ""
-                                        lockedRec = null
-                                        lockedActive = null
-                                    }
-                                } else {
-                                    delay(360L)
                                 }
                             }
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedRec = null
+                            lockedActive = null
+                        } else {
+                            delay(340L)
                         }
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Picks a piece, hovers over its target with touch held down, reads the game's live ghost preview,
+     * nudges to exact cell alignment before lifting the finger, and refines saved offsets.
+     */
+    private suspend fun performLivePreviewSnapDrop(
+        config: AdaptiveRoiConfig,
+        rec: MoveRecommendation,
+        preFrame: CaptureAttempt.Frame,
+        preBoardMask: Long,
+        onConfigRefined: suspend (AdaptiveRoiConfig) -> Unit
+    ): Boolean {
+        val profile = config.globalProfile
+        val endpoints = config.computeDragEndpoints(
+            slotIndex = rec.slotIndex,
+            targetRow = rec.targetRow,
+            targetCol = rec.targetCol,
+            pieceWidth = rec.piece.width,
+            pieceHeight = rec.piece.height,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx
+        )
+
+        val preCellColors = withContext(Dispatchers.Default) {
+            PreviewHoverDetector.captureCellBaselines(
+                preFrame.pixelFrame,
+                preFrame.width,
+                preFrame.height,
+                config
+            )
+        }
+
+        val hold = performBeginHoldDrag(
+            startX = endpoints.startX,
+            startY = endpoints.startY,
+            toX = endpoints.endX,
+            toY = endpoints.endY,
+            pressMs = profile.pressDurationMs,
+            glideMs = profile.glideDurationMs
+        ) ?: return false
+
+        // Respect Android Accessibility screenshot interval while holding piece suspended
+        val elapsedSincePre = SystemClock.elapsedRealtime() - preFrame.capturedAtMs
+        if (elapsedSincePre < 355L) {
+            delay(355L - elapsedSincePre)
+        }
+
+        val hoverAttempt = captureFrameViaAccessibility()
+        if (hoverAttempt is CaptureAttempt.Frame) {
+            val match = withContext(Dispatchers.Default) {
+                PreviewHoverDetector.detectHoveredPreview(
+                    hoverFrame = hoverAttempt.pixelFrame,
+                    width = hoverAttempt.width,
+                    height = hoverAttempt.height,
+                    config = config,
+                    preBoardMask = preBoardMask,
+                    preCellColors = preCellColors,
+                    piece = rec.piece
+                )
+            }
+            if (match != null && (match.row != rec.targetRow || match.col != rec.targetCol)) {
+                val safeGainX = config.dragHorizontalGain.coerceIn(0.65f, 1.50f)
+                val safeGainY = config.dragVerticalGain.coerceIn(0.65f, 2.00f)
+                val errRow = match.row - rec.targetRow
+                val errCol = match.col - rec.targetCol
+
+                val correctedX = (hold.currentX - (errCol * endpoints.cellWidthPx) / safeGainX)
+                    .coerceIn(endpoints.cellWidthPx * 0.3f, screenWidthPx - endpoints.cellWidthPx * 0.3f)
+                val correctedY = (hold.currentY - (errRow * endpoints.cellHeightPx) / safeGainY)
+                    .coerceIn(endpoints.cellHeightPx * 0.35f, screenHeightPx - 32f)
+
+                performNudgeHoldDrag(hold, correctedX, correctedY, durationMs = 75L)
+                val refined = AutoplayMoveVerifier.adjustFromSingleHoverObservation(
+                    config = config,
+                    screenWidthPx = screenWidthPx,
+                    screenHeightPx = screenHeightPx,
+                    targetRow = rec.targetRow,
+                    targetCol = rec.targetCol,
+                    observedRow = match.row,
+                    observedCol = match.col
+                )
+                onConfigRefined(refined)
+            }
+        }
+
+        return performReleaseHoldDrag(hold, profile.settleDurationMs)
+    }
+
+    /**
+     * Non-destructive Guided 3-Point Preview Calibration:
+     * Picks up a tray piece, visits up to 3 spread-out board anchors with touch held open, reads the
+     * actual translucent ghost preview at each probe point, then returns cleanly to the tray start
+     * slot before lifting — fitting exact 4-parameter affine screen-space movement without dropping!
+     */
+    private suspend fun runGuidedPreviewCalibration(
+        config: AdaptiveRoiConfig,
+        startFrame: CaptureAttempt.Frame,
+        parsed: ParsedFrame.ActiveBoard
+    ) {
+        val plan = PreviewHoverDetector.selectGuidedCalibrationPlan(parsed.boardMask, parsed.tray)
+        if (plan == null) {
+            OverlayStateStore.finishGuidedCalibration("Need open cells on board for Guided Calibration.")
+            return
+        }
+
+        val preCellColors = withContext(Dispatchers.Default) {
+            PreviewHoverDetector.captureCellBaselines(
+                startFrame.pixelFrame,
+                startFrame.width,
+                startFrame.height,
+                config
+            )
+        }
+
+        val firstAnchor = plan.anchors.first()
+        val firstEndpoints = config.computeDragEndpoints(
+            slotIndex = plan.slotIndex,
+            targetRow = firstAnchor.first,
+            targetCol = firstAnchor.second,
+            pieceWidth = plan.piece.width,
+            pieceHeight = plan.piece.height,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx
+        )
+        val startX = firstEndpoints.startX
+        val startY = firstEndpoints.startY
+
+        OverlayStateStore.setCalibratingStep(1, "Calibrating Point 1/${plan.anchors.size} (reading preview)…")
+        val hold = performBeginHoldDrag(
+            startX = startX,
+            startY = startY,
+            toX = firstEndpoints.endX,
+            toY = firstEndpoints.endY,
+            pressMs = 45L,
+            glideMs = 240L
+        )
+        if (hold == null) {
+            OverlayStateStore.finishGuidedCalibration("Guided Calibration canceled — touch interrupted.")
+            return
+        }
+
+        val collectedSamples = ArrayList<PreviewCalibrationSample>(plan.anchors.size)
+        var lastCaptureMs = startFrame.capturedAtMs
+
+        try {
+            for ((idx, anchor) in plan.anchors.withIndex()) {
+                if (idx > 0) {
+                    OverlayStateStore.setCalibratingStep(
+                        idx + 1,
+                        "Calibrating Point ${idx + 1}/${plan.anchors.size} (measuring offset)…"
+                    )
+                    val ep = config.computeDragEndpoints(
+                        slotIndex = plan.slotIndex,
+                        targetRow = anchor.first,
+                        targetCol = anchor.second,
+                        pieceWidth = plan.piece.width,
+                        pieceHeight = plan.piece.height,
+                        screenWidthPx = screenWidthPx,
+                        screenHeightPx = screenHeightPx
+                    )
+                    if (!performNudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 200L)) break
+                }
+
+                // Wait out Android Accessibility screenshot rate-limit (~350ms) while holding piece open
+                val elapsed = SystemClock.elapsedRealtime() - lastCaptureMs
+                if (elapsed < 355L) delay(355L - elapsed)
+
+                var hoverAttempt = captureFrameViaAccessibility()
+                if (hoverAttempt is CaptureAttempt.Throttled) {
+                    delay(260L)
+                    hoverAttempt = captureFrameViaAccessibility()
+                }
+                if (hoverAttempt is CaptureAttempt.Frame) {
+                    lastCaptureMs = hoverAttempt.capturedAtMs
+                    val match = withContext(Dispatchers.Default) {
+                        PreviewHoverDetector.detectHoveredPreview(
+                            hoverFrame = hoverAttempt.pixelFrame,
+                            width = hoverAttempt.width,
+                            height = hoverAttempt.height,
+                            config = config,
+                            preBoardMask = parsed.boardMask,
+                            preCellColors = preCellColors,
+                            piece = plan.piece
+                        )
+                    }
+                    if (match != null) {
+                        collectedSamples.add(
+                            PreviewCalibrationSample(
+                                slotIndex = plan.slotIndex,
+                                startX = startX,
+                                startY = startY,
+                                fingerX = hold.currentX,
+                                fingerY = hold.currentY,
+                                observedRow = match.row,
+                                observedCol = match.col,
+                                pieceWidth = plan.piece.width,
+                                pieceHeight = plan.piece.height
+                            )
+                        )
+                    }
+                }
+            }
+        } finally {
+            // Slide safely back into the tray slot BEFORE releasing so Block Blast cancels without placing
+            performNudgeHoldDrag(hold, startX, startY, durationMs = 210L)
+            performReleaseHoldDrag(hold, settleMs = 45L)
+        }
+
+        val calUpdate = if (collectedSamples.size >= 2) {
+            AutoplayMoveVerifier.fitAffineFromPreviewSamples(
+                config = config,
+                screenWidthPx = screenWidthPx,
+                screenHeightPx = screenHeightPx,
+                samples = collectedSamples
+            )
+        } else {
+            null
+        }
+
+        if (calUpdate != null) {
+            OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
+            persistMovementCalibration(calUpdate.updatedConfig)
+            OverlayStateStore.finishGuidedCalibration(calUpdate.summary)
+        } else {
+            OverlayStateStore.finishGuidedCalibration(
+                "Need 2+ open preview spots to calibrate — pause & retry on cleaner board."
+            )
         }
     }
 
@@ -464,18 +790,20 @@ class TacticianAccessibilityService : AccessibilityService() {
             current.copy(
                 dragLiftOffsetCells = calibrated.dragLiftOffsetCells,
                 dragVerticalGain = calibrated.dragVerticalGain,
+                dragHorizontalOffsetCells = calibrated.dragHorizontalOffsetCells,
                 dragHorizontalGain = calibrated.dragHorizontalGain,
                 calibratedScreenWidthPx = calibrated.calibratedScreenWidthPx,
                 calibratedScreenHeightPx = calibrated.calibratedScreenHeightPx,
-                dragCalibrationSamples = calibrated.dragCalibrationSamples
+                dragCalibrationSamples = calibrated.dragCalibrationSamples,
+                isPreviewLocked = calibrated.isPreviewLocked
             )
         }
     }
 
-    private suspend fun awaitSettledPostDropBoard(config: AdaptiveRoiConfig): ParsedFrame.ActiveBoard? {
+    private suspend fun awaitSettledPostDropBoard(config: AdaptiveRoiConfig): SettledBoardResult? {
         for (attempt in 0 until 4) {
             when (val cap = captureFrameViaAccessibility()) {
-                is CaptureAttempt.Throttled -> delay(380L)
+                is CaptureAttempt.Throttled -> delay(350L)
                 is CaptureAttempt.UnsupportedOrError -> return null
                 is CaptureAttempt.Frame -> {
                     val parsed = parser.parse(
@@ -485,8 +813,10 @@ class TacticianAccessibilityService : AccessibilityService() {
                         config = config,
                         requireStability = false
                     )
-                    if (parsed is ParsedFrame.ActiveBoard) return parsed
-                    delay(260L)
+                    if (parsed is ParsedFrame.ActiveBoard) {
+                        return SettledBoardResult(parsed, cap)
+                    }
+                    delay(220L)
                 }
             }
         }
@@ -551,7 +881,8 @@ class TacticianAccessibilityService : AccessibilityService() {
                                     CaptureAttempt.Frame(
                                         pixelFrame = IntArrayPixelFrame(pixels, w, h),
                                         width = w,
-                                        height = h
+                                        height = h,
+                                        capturedAtMs = SystemClock.elapsedRealtime()
                                     )
                                 )
                             } catch (_: Throwable) {
@@ -581,6 +912,86 @@ class TacticianAccessibilityService : AccessibilityService() {
             }
         }
 
+    private suspend fun performBeginHoldDrag(
+        startX: Float,
+        startY: Float,
+        toX: Float,
+        toY: Float,
+        pressMs: Long,
+        glideMs: Long
+    ): ActiveHoldDrag? {
+        val pressEndY = startY + 1f
+        val pressPath = Path().apply {
+            moveTo(startX, startY)
+            lineTo(startX, pressEndY)
+        }
+        val pressStroke = GestureDescription.StrokeDescription(pressPath, 0L, pressMs.coerceAtLeast(18L), true)
+        if (!dispatchStroke(pressStroke)) return null
+
+        val glidePath = Path().apply {
+            moveTo(startX, pressEndY)
+            val steps = 14
+            for (i in 1..steps) {
+                val t = i.toFloat() / steps
+                val eased = t * t * (3f - 2f * t)
+                lineTo(startX + (toX - startX) * eased, pressEndY + (toY - pressEndY) * eased)
+            }
+        }
+        val glideStroke = pressStroke.continueStroke(glidePath, 0L, glideMs.coerceAtLeast(80L), true)
+        if (!dispatchStroke(glideStroke)) {
+            val cancelPath = Path().apply { moveTo(startX, pressEndY); lineTo(startX, pressEndY) }
+            dispatchStroke(glideStroke.continueStroke(cancelPath, 0L, 16L, false))
+            return null
+        }
+        return ActiveHoldDrag(glideStroke, toX, toY)
+    }
+
+    private suspend fun performNudgeHoldDrag(
+        handle: ActiveHoldDrag,
+        toX: Float,
+        toY: Float,
+        durationMs: Long
+    ): Boolean {
+        val fromX = handle.currentX
+        val fromY = handle.currentY
+        val path = Path().apply {
+            moveTo(fromX, fromY)
+            val steps = 8
+            for (i in 1..steps) {
+                val t = i.toFloat() / steps
+                val eased = t * t * (3f - 2f * t)
+                lineTo(fromX + (toX - fromX) * eased, fromY + (toY - fromY) * eased)
+            }
+        }
+        val nextStroke = handle.currentStroke.continueStroke(path, 0L, durationMs.coerceAtLeast(24L), true)
+        val ok = dispatchStroke(nextStroke)
+        handle.currentStroke = nextStroke
+        if (ok) {
+            handle.currentX = toX
+            handle.currentY = toY
+        }
+        return ok
+    }
+
+    private suspend fun performReleaseHoldDrag(
+        handle: ActiveHoldDrag,
+        settleMs: Long
+    ): Boolean {
+        val endX = handle.currentX
+        val endY = handle.currentY
+        val releasePath = Path().apply {
+            moveTo(endX, endY)
+            lineTo(endX, endY)
+        }
+        val releaseStroke = handle.currentStroke.continueStroke(
+            releasePath,
+            0L,
+            settleMs.coerceAtLeast(20L),
+            false
+        )
+        return dispatchStroke(releaseStroke)
+    }
+
     private suspend fun performPieceDrag(
         config: AdaptiveRoiConfig,
         rec: MoveRecommendation,
@@ -590,6 +1001,7 @@ class TacticianAccessibilityService : AccessibilityService() {
         updateDisplayMetrics()
         val effectiveW = if (screenWidthPx > 0) screenWidthPx else screenW
         val effectiveH = if (screenHeightPx > 0) screenHeightPx else screenH
+        val profile = config.globalProfile
 
         val endpoints = config.computeDragEndpoints(
             slotIndex = rec.slotIndex,
@@ -601,50 +1013,16 @@ class TacticianAccessibilityService : AccessibilityService() {
             screenHeightPx = effectiveH
         )
 
-        val touchX = endpoints.startX
-        val touchY = endpoints.startY
-        val endX = endpoints.endX
-        val endY = endpoints.endY
+        val hold = performBeginHoldDrag(
+            startX = endpoints.startX,
+            startY = endpoints.startY,
+            toX = endpoints.endX,
+            toY = (endpoints.endY - 1f).coerceAtLeast(8f),
+            pressMs = profile.pressDurationMs,
+            glideMs = profile.glideDurationMs
+        ) ?: return false
 
-        // Segment 1: Touch down and hold 45ms so the tray picks up the piece cleanly
-        val pressEndY = touchY + 1f
-        val pressPath = Path().apply {
-            moveTo(touchX, touchY)
-            lineTo(touchX, pressEndY)
-        }
-        val pressStroke = GestureDescription.StrokeDescription(pressPath, 0L, 45L, true)
-        if (!dispatchStroke(pressStroke)) return false
-
-        // Segment 2: Smooth ease-in-out glide over 330ms to destination
-        val glideEndY = (endY - 1f).coerceAtLeast(8f)
-        val glidePath = Path().apply {
-            moveTo(touchX, pressEndY)
-            val steps = 16
-            for (i in 1..steps) {
-                val t = i.toFloat() / steps
-                val eased = t * t * (3f - 2f * t)
-                val px = touchX + (endX - touchX) * eased
-                val py = pressEndY + (glideEndY - pressEndY) * eased
-                lineTo(px, py)
-            }
-        }
-        val glideStroke = pressStroke.continueStroke(glidePath, 0L, 330L, true)
-        if (!dispatchStroke(glideStroke)) {
-            val releasePath = Path().apply {
-                moveTo(endX, glideEndY)
-                lineTo(endX, glideEndY)
-            }
-            dispatchStroke(glideStroke.continueStroke(releasePath, 0L, 20L, false))
-            return false
-        }
-
-        // Segment 3: Hold steady for 75ms over target cell before lifting finger
-        val settlePath = Path().apply {
-            moveTo(endX, glideEndY)
-            lineTo(endX, endY)
-        }
-        val settleStroke = glideStroke.continueStroke(settlePath, 0L, 75L, false)
-        return dispatchStroke(settleStroke)
+        return performReleaseHoldDrag(hold, profile.settleDurationMs)
     }
 
     private suspend fun dispatchStroke(stroke: GestureDescription.StrokeDescription): Boolean =

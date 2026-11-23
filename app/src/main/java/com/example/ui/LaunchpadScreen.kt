@@ -35,11 +35,11 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -66,9 +66,8 @@ import com.example.data.CaptureSource
 import com.example.data.OverlayRuntimeState
 import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
+import com.example.engine.GlobalProfile
 import com.example.engine.OperatingMode
-import com.example.engine.SolverMode
-import com.example.engine.ThinkingDepth
 import com.example.ui.theme.AmberPop
 import com.example.ui.theme.AmberPopContainer
 import com.example.ui.theme.CoralPulse
@@ -86,8 +85,7 @@ fun LaunchpadScreen(
     onRequestOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onSelectOperatingMode: (OperatingMode) -> Unit,
-    onSelectSolverMode: (SolverMode) -> Unit,
-    onSelectThinkingDepth: (ThinkingDepth) -> Unit,
+    onSelectGlobalProfile: (GlobalProfile) -> Unit,
     onLaunchOverlay: () -> Unit,
     onLaunchProjectionFallback: () -> Unit,
     onTogglePause: () -> Unit,
@@ -101,9 +99,9 @@ fun LaunchpadScreen(
     val statusColor by animateColorAsState(
         targetValue = when (runtime.status) {
             ServiceStatus.GUIDING, ServiceStatus.DRAGGING, ServiceStatus.VERIFYING -> MintSurge
+            ServiceStatus.CALIBRATING, ServiceStatus.PAUSED -> AmberPop
             ServiceStatus.THINKING -> Color(0xFF7B9DFF)
             ServiceStatus.SEARCHING -> ElectricCobalt
-            ServiceStatus.PAUSED -> AmberPop
             ServiceStatus.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
         },
         label = "status_color"
@@ -117,6 +115,7 @@ fun LaunchpadScreen(
         ServiceStatus.GUIDING -> stringResource(R.string.status_guiding)
         ServiceStatus.DRAGGING -> stringResource(R.string.status_dragging)
         ServiceStatus.VERIFYING -> stringResource(R.string.status_verifying)
+        ServiceStatus.CALIBRATING -> stringResource(R.string.status_calibrating)
     }
 
     val pulseTransition = rememberInfiniteTransition(label = "hero_pulse")
@@ -137,7 +136,7 @@ fun LaunchpadScreen(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        // Expressive Hero Surface with live engine telemetry
+        // Expressive Hero Surface with live engine telemetry, combo streak & preview lock status
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -236,6 +235,65 @@ fun LaunchpadScreen(
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+
+                    // Telemetry pills: Preview Lock + Calibration + Live Combo Streak
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (roiConfig.isPreviewLocked) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = MintSurgeContainer,
+                                modifier = Modifier.testTag("preview_locked_pill")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Verified,
+                                        contentDescription = null,
+                                        tint = MintSurge,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Text(
+                                        text = "Preview-Locked",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MintSurge
+                                    )
+                                }
+                            }
+                        }
+
+                        if (isRunning || runtime.comboState.comboStreak > 0) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = if (runtime.comboState.comboStreak > 0) {
+                                    AmberPopContainer.copy(alpha = 0.7f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainerHigh
+                                },
+                                modifier = Modifier.testTag("combo_streak_pill")
+                            ) {
+                                val streak = runtime.comboState.comboStreak
+                                val rem = (3 - runtime.comboState.placementsSinceClear).coerceAtLeast(1)
+                                val comboLabel = if (streak > 0) {
+                                    "Combo ×$streak ($rem moves left)"
+                                } else {
+                                    "${runtime.comboState.totalLinesCleared} lines cleared"
+                                }
+                                Text(
+                                    text = comboLabel,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (streak > 0) AmberPop else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
                     }
 
                     val calBadgeText = when {
@@ -358,7 +416,6 @@ fun LaunchpadScreen(
                     )
                 }
 
-                // Offer explicit MediaProjection fallback button if Accessibility capture is active on API 30+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && permissions.hasAccessibilityPermission) {
                     OutlinedButton(
                         onClick = onLaunchProjectionFallback,
@@ -369,7 +426,7 @@ fun LaunchpadScreen(
                         shape = RoundedCornerShape(50)
                     ) {
                         Text(
-                            text = "Or Start via MediaProjection Stream (200 ms)",
+                            text = "Or Start via MediaProjection Stream (60 Hz Preview-Snap)",
                             style = MaterialTheme.typography.labelLarge
                         )
                     }
@@ -461,6 +518,37 @@ fun LaunchpadScreen(
             )
         }
 
+        // Built-In Global Profiles (unifying AI search depth, combo strategy & drag cadence)
+        Text(
+            text = stringResource(R.string.profile_section_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            GlobalProfileCard(
+                profile = GlobalProfile.MAX_COMBOS_SCORE,
+                icon = Icons.Rounded.Bolt,
+                accentColor = AmberPop,
+                selected = roiConfig.globalProfile == GlobalProfile.MAX_COMBOS_SCORE,
+                onClick = { onSelectGlobalProfile(GlobalProfile.MAX_COMBOS_SCORE) }
+            )
+            GlobalProfileCard(
+                profile = GlobalProfile.MAX_SURVIVAL,
+                icon = Icons.Rounded.Shield,
+                accentColor = MintSurge,
+                selected = roiConfig.globalProfile == GlobalProfile.MAX_SURVIVAL,
+                onClick = { onSelectGlobalProfile(GlobalProfile.MAX_SURVIVAL) }
+            )
+            GlobalProfileCard(
+                profile = GlobalProfile.FASTEST_SPEED,
+                icon = Icons.Rounded.Speed,
+                accentColor = ElectricCobalt,
+                selected = roiConfig.globalProfile == GlobalProfile.FASTEST_SPEED,
+                onClick = { onSelectGlobalProfile(GlobalProfile.FASTEST_SPEED) }
+            )
+        }
+
         // Permissions & System Readiness Section
         Text(
             text = "System Readiness",
@@ -513,78 +601,6 @@ fun LaunchpadScreen(
             }
         }
 
-        // Thinking Depth Picker
-        Text(
-            text = stringResource(R.string.depth_title),
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurface
-        )
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            OptionCard(
-                title = stringResource(R.string.depth_ultra_deep),
-                subtitle = stringResource(R.string.depth_ultra_deep_desc),
-                icon = Icons.Rounded.Psychology,
-                accentColor = MintSurge,
-                selected = roiConfig.thinkingDepth == ThinkingDepth.ULTRA_DEEP,
-                onClick = { onSelectThinkingDepth(ThinkingDepth.ULTRA_DEEP) },
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("depth_ultra_deep_card")
-            )
-
-            OptionCard(
-                title = stringResource(R.string.depth_balanced),
-                subtitle = stringResource(R.string.depth_balanced_desc),
-                icon = Icons.Rounded.Speed,
-                accentColor = ElectricCobalt,
-                selected = roiConfig.thinkingDepth == ThinkingDepth.BALANCED_FAST,
-                onClick = { onSelectThinkingDepth(ThinkingDepth.BALANCED_FAST) },
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("depth_balanced_card")
-            )
-        }
-
-        // Solver Strategy Picker
-        Text(
-            text = stringResource(R.string.strategy_title),
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurface
-        )
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            OptionCard(
-                title = stringResource(R.string.strategy_balanced),
-                subtitle = stringResource(R.string.strategy_balanced_desc),
-                icon = Icons.Rounded.Shield,
-                accentColor = MintSurge,
-                selected = roiConfig.solverMode == SolverMode.BALANCED_SURVIVAL,
-                onClick = { onSelectSolverMode(SolverMode.BALANCED_SURVIVAL) },
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("strategy_balanced_card")
-            )
-
-            OptionCard(
-                title = stringResource(R.string.strategy_combo),
-                subtitle = stringResource(R.string.strategy_combo_desc),
-                icon = Icons.Rounded.Bolt,
-                accentColor = AmberPop,
-                selected = roiConfig.solverMode == SolverMode.COMBO_MAXIMIZER,
-                onClick = { onSelectSolverMode(SolverMode.COMBO_MAXIMIZER) },
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("strategy_combo_card")
-            )
-        }
-
         Surface(
             shape = MaterialTheme.shapes.medium,
             color = MaterialTheme.colorScheme.surfaceContainerLow
@@ -602,7 +618,7 @@ fun LaunchpadScreen(
                     tint = ElectricCobalt
                 )
                 Text(
-                    text = "Verify-After-Drop measures your phone's exact screen dimensions and upward drag gain in real time, saving calibration to private storage across launches.",
+                    text = "Adaptive 64-bit bitwise lookahead scales compute dynamically from sub-15 ms on open boards up to deep 2-turn survival rollouts on tight boards.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -610,6 +626,93 @@ fun LaunchpadScreen(
         }
 
         Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun GlobalProfileCard(
+    profile: GlobalProfile,
+    icon: ImageVector,
+    accentColor: Color,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val bgColor = if (selected) {
+        when (accentColor) {
+            AmberPop -> AmberPopContainer.copy(alpha = 0.55f)
+            ElectricCobalt -> ElectricCobalt.copy(alpha = 0.16f)
+            else -> MintSurgeContainer.copy(alpha = 0.65f)
+        }
+    } else {
+        MaterialTheme.colorScheme.surfaceContainer
+    }
+
+    Surface(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("profile_${profile.name.lowercase()}_card"),
+        shape = MaterialTheme.shapes.medium,
+        color = bgColor,
+        border = BorderStroke(
+            width = if (selected) 2.dp else 1.dp,
+            color = if (selected) accentColor else MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = accentColor.copy(alpha = if (selected) 0.24f else 0.12f),
+                modifier = Modifier.size(44.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = accentColor
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = profile.label,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh
+                    ) {
+                        Text(
+                            text = "${profile.openBudgetMs}–${profile.criticalBudgetMs}ms • ${profile.glideDurationMs}ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (selected) accentColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+                Text(
+                    text = profile.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 

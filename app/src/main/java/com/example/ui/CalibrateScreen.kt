@@ -13,11 +13,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Verified
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -39,12 +45,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.engine.AdaptiveRoiConfig
 import com.example.ui.theme.AmberPop
+import com.example.ui.theme.AmberPopContainer
 import com.example.ui.theme.ElectricCobalt
 import com.example.ui.theme.MintSurge
+import com.example.ui.theme.MintSurgeContainer
+import com.example.ui.theme.OnMintSurge
 import kotlin.math.roundToInt
 
 private enum class CalibrateThemePreview(val label: String) {
@@ -56,11 +66,16 @@ private enum class CalibrateThemePreview(val label: String) {
 @Composable
 fun CalibrateScreen(
     config: AdaptiveRoiConfig,
+    isCalibratingPending: Boolean,
+    calibratingStep: Int,
+    onArmGuidedCalibration: () -> Unit,
     onUpdateGridBounds: (leftMargin: Float, top: Float, bottom: Float) -> Unit,
     onUpdateTrayBounds: (trayTop: Float, trayHeight: Float) -> Unit,
     onUpdateOpacity: (Float) -> Unit,
     onUpdateDragLift: (Float) -> Unit,
     onUpdateDragVerticalGain: (Float) -> Unit,
+    onUpdateDragHorizontalOffset: (Float) -> Unit,
+    onUpdateDragHorizontalGain: (Float) -> Unit,
     onResetDefaults: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -89,7 +104,9 @@ fun CalibrateScreen(
 
         // Saved Phone Calibration Status Card
         val formattedLiftHeader = ((config.dragLiftOffsetCells * 100f).roundToInt() / 100f)
-        val formattedGainHeader = ((config.dragVerticalGain * 100f).roundToInt() / 100f)
+        val formattedGainYHeader = ((config.dragVerticalGain * 100f).roundToInt() / 100f)
+        val formattedOffXHeader = ((config.dragHorizontalOffsetCells * 100f).roundToInt() / 100f)
+        val formattedGainXHeader = ((config.dragHorizontalGain * 100f).roundToInt() / 100f)
         val screenBadge = if (config.calibratedScreenWidthPx > 0 && config.calibratedScreenHeightPx > 0) {
             "${config.calibratedScreenWidthPx}×${config.calibratedScreenHeightPx} px"
         } else {
@@ -98,30 +115,122 @@ fun CalibrateScreen(
         Surface(
             shape = MaterialTheme.shapes.medium,
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            border = BorderStroke(1.dp, MintSurge.copy(alpha = 0.35f)),
+            border = BorderStroke(
+                1.dp,
+                if (config.isPreviewLocked) MintSurge.copy(alpha = 0.65f) else ElectricCobalt.copy(alpha = 0.35f)
+            ),
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("saved_calibration_card")
         ) {
             Column(
                 modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Saved Phone Calibration",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MintSurge
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = if (config.isPreviewLocked) MintSurgeContainer else MaterialTheme.colorScheme.surfaceContainer
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (config.isPreviewLocked) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Verified,
+                                    contentDescription = null,
+                                    tint = MintSurge,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                            Text(
+                                text = if (config.isPreviewLocked) "Preview-Locked" else "Self-Learning",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (config.isPreviewLocked) MintSurge else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
                 Text(
-                    text = "Saved Phone Calibration",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MintSurge
-                )
-                Text(
-                    text = "Screen: $screenBadge • ${config.dragCalibrationSamples} drops calibrated",
+                    text = "Screen: $screenBadge • ${config.dragCalibrationSamples} calibration samples",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = "Vertical Gain: ${formattedGainHeader}x • Lift Offset: +$formattedLiftHeader cells",
+                    text = "Y: ${formattedGainYHeader}x, +$formattedLiftHeader c  |  X: ${formattedGainXHeader}x, ${formattedOffXHeader}c",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+
+        // Guided 3-Point Non-Destructive Preview Calibration Card
+        Surface(
+            shape = MaterialTheme.shapes.large,
+            color = if (isCalibratingPending || calibratingStep > 0) {
+                AmberPopContainer.copy(alpha = 0.45f)
+            } else {
+                MaterialTheme.colorScheme.surfaceContainer
+            },
+            border = BorderStroke(
+                1.dp,
+                if (isCalibratingPending || calibratingStep > 0) AmberPop else MintSurge.copy(alpha = 0.4f)
+            ),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = stringResource(R.string.guided_cal_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = stringResource(R.string.guided_cal_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Button(
+                    onClick = onArmGuidedCalibration,
+                    shape = RoundedCornerShape(50),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isCalibratingPending || calibratingStep > 0) AmberPop else MintSurge,
+                        contentColor = OnMintSurge
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .testTag("guided_calibrate_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.CenterFocusStrong,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    val btnText = when {
+                        calibratingStep > 0 -> "Calibrating Point $calibratingStep/3…"
+                        isCalibratingPending -> stringResource(R.string.guided_cal_armed)
+                        else -> stringResource(R.string.guided_cal_cta)
+                    }
+                    Text(
+                        text = btnText,
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
             }
         }
 
@@ -233,22 +342,22 @@ fun CalibrateScreen(
                         }
                     }
 
-                    // Sample target cell vs Autoplay finger touch point (using persisted gain & lift)
+                    // Sample target cell vs Autoplay finger touch point (4-param affine compensation)
                     val previewEndpoints = config.computeDragEndpoints(
-                        slotIndex = 1,
+                        slotIndex = 0,
                         targetRow = 2,
-                        targetCol = 3,
+                        targetCol = 5,
                         pieceWidth = 1,
                         pieceHeight = 1,
                         screenWidthPx = w.roundToInt().coerceAtLeast(100),
                         screenHeightPx = h.roundToInt().coerceAtLeast(200)
                     )
                     val sampleTarget = Offset(
-                        gLeft + 3.5f * cw,
+                        previewEndpoints.baseTargetX,
                         previewEndpoints.baseTargetY
                     )
                     val touchDrop = Offset(
-                        previewEndpoints.endX,
+                        previewEndpoints.endX.coerceIn(12f, w - 12f),
                         previewEndpoints.endY.coerceIn(gTop * 0.6f, h - 16f)
                     )
                     drawLine(
@@ -295,17 +404,33 @@ fun CalibrateScreen(
                 SliderSetting(
                     label = "Vertical Drag Gain",
                     valueText = "${formattedGain}x",
-                    value = config.dragVerticalGain.coerceIn(0.75f, 1.95f),
-                    range = 0.75f..1.95f,
+                    value = config.dragVerticalGain.coerceIn(0.65f, 1.95f),
+                    range = 0.65f..1.95f,
                     onValueChange = onUpdateDragVerticalGain
                 )
                 val formattedLift = ((config.dragLiftOffsetCells * 10f).roundToInt() / 10f)
                 SliderSetting(
-                    label = "Autoplay Drag Lift Offset",
+                    label = "Vertical Lift Offset",
                     valueText = "${if (formattedLift >= 0f) "+" else ""}$formattedLift cells",
                     value = config.dragLiftOffsetCells.coerceIn(-1.0f, 4.8f),
                     range = -1.0f..4.8f,
                     onValueChange = onUpdateDragLift
+                )
+                val formattedGainX = ((config.dragHorizontalGain * 100f).roundToInt() / 100f)
+                SliderSetting(
+                    label = "Horizontal Drag Gain",
+                    valueText = "${formattedGainX}x",
+                    value = config.dragHorizontalGain.coerceIn(0.65f, 1.45f),
+                    range = 0.65f..1.45f,
+                    onValueChange = onUpdateDragHorizontalGain
+                )
+                val formattedOffX = ((config.dragHorizontalOffsetCells * 10f).roundToInt() / 10f)
+                SliderSetting(
+                    label = "Horizontal Offset",
+                    valueText = "${if (formattedOffX >= 0f) "+" else ""}$formattedOffX cells",
+                    value = config.dragHorizontalOffsetCells.coerceIn(-2.5f, 2.5f),
+                    range = -2.5f..2.5f,
+                    onValueChange = onUpdateDragHorizontalOffset
                 )
                 SliderSetting(
                     label = "Grid Top Edge",

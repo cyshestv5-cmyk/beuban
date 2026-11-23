@@ -284,8 +284,7 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
                             }
                         },
                         onSelectOperatingMode = vm::setOperatingMode,
-                        onSelectSolverMode = vm::setSolverMode,
-                        onSelectThinkingDepth = vm::setThinkingDepth,
+                        onSelectGlobalProfile = vm::setGlobalProfile,
                         onLaunchOverlay = ::launchEngineFlow,
                         onLaunchProjectionFallback = ::launchProjectionFlow,
                         onTogglePause = vm::togglePauseCaptureService,
@@ -295,11 +294,30 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
                 composable(ROUTE_CALIBRATE) {
                     CalibrateScreen(
                         config = roiConfig,
+                        isCalibratingPending = runtime.pendingGuidedCalibration,
+                        calibratingStep = runtime.guidedCalibrationStep,
+                        onArmGuidedCalibration = {
+                            val armed = vm.armGuidedCalibration()
+                            if (armed) {
+                                if (runtime.status == com.example.data.ServiceStatus.STOPPED &&
+                                    permissions.hasAccessibilityPermission
+                                ) {
+                                    vm.tryStartAccessibilitySession()
+                                }
+                                scope.launch {
+                                    snackbarHostState.showSnackbar(
+                                        "Guided 3-Point Calibration armed — switch to Block Blast Lite!"
+                                    )
+                                }
+                            }
+                        },
                         onUpdateGridBounds = vm::updateGridBounds,
                         onUpdateTrayBounds = vm::updateTrayBounds,
                         onUpdateOpacity = vm::updateOverlayOpacity,
                         onUpdateDragLift = vm::updateDragLiftOffset,
                         onUpdateDragVerticalGain = vm::updateDragVerticalGain,
+                        onUpdateDragHorizontalOffset = vm::updateDragHorizontalOffset,
+                        onUpdateDragHorizontalGain = vm::updateDragHorizontalGain,
                         onResetDefaults = vm::resetRoiDefaults
                     )
                 }

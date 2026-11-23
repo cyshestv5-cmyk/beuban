@@ -36,9 +36,12 @@ import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
 import com.example.engine.ByteBufferPixelFrame
 import com.example.engine.DropVerificationResult
+import com.example.engine.IntArrayPixelFrame
 import com.example.engine.MoveRecommendation
 import com.example.engine.OperatingMode
 import com.example.engine.ParsedFrame
+import com.example.engine.PreviewCalibrationSample
+import com.example.engine.PreviewHoverDetector
 import com.example.engine.TraySlotState
 import com.example.overlay.OverlayWindowHost
 import kotlin.math.max
@@ -55,9 +58,9 @@ import kotlinx.coroutines.withContext
 
 /**
  * Android 15+ compliant MediaProjection Foreground Service.
- * Serves as the automatic fallback screen reader on Android 8-10 or whenever Accessibility
- * screenshot capture is unavailable/throttled, and coordinates with TacticianAccessibilityService
- * for Autoplay gesture execution + Verify-After-Drop.
+ * Serves as the high-frequency 60Hz fallback screen reader on Android 8-10 or whenever
+ * Accessibility screenshot capture is unavailable/throttled, coordinating with
+ * TacticianAccessibilityService for Live Preview-Snap Autoplay and Guided 3-Point Calibration.
  */
 class ScreenCaptureService : Service() {
 
@@ -70,9 +73,21 @@ class ScreenCaptureService : Service() {
 
         private const val CHANNEL_ID = "tactician_capture_channel"
         private const val NOTIFICATION_ID = 4107
-        private const val ACTIVE_POLL_MS = 200L
-        private const val IDLE_POLL_MS = 450L
+        private const val ACTIVE_POLL_MS = 160L
+        private const val IDLE_POLL_MS = 400L
     }
+
+    private data class SnapshotFrame(
+        val pixelFrame: IntArrayPixelFrame,
+        val width: Int,
+        val height: Int
+    )
+
+    private data class AcquiredParsedFrame(
+        val parsed: ParsedFrame,
+        val updatedConfig: AdaptiveRoiConfig?,
+        val preCellColors: IntArray?
+    )
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -158,7 +173,6 @@ class ScreenCaptureService : Service() {
                     return START_NOT_STICKY
                 }
 
-                // Ensure native Accessibility capture loop yields before starting MediaProjection stream
                 TacticianAccessibilityService.stopNativeSession()
 
                 startForegroundWithType(isPaused = false)
@@ -254,10 +268,14 @@ class ScreenCaptureService : Service() {
             var consecutiveIdleFrames = 0
             var failedDropStreak = 0
             var hasVerifiedLayoutForSession = false
+            var carryoverBoard: ParsedFrame.ActiveBoard? = null
+            var carryoverBaselines: IntArray? = null
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
                 if (state.status == ServiceStatus.PAUSED || !isContentVisible) {
+                    carryoverBoard = null
+                    carryoverBaselines = null
                     delay(IDLE_POLL_MS)
                     continue
                 }
@@ -268,25 +286,34 @@ class ScreenCaptureService : Service() {
                     activeConfig.calibratedScreenWidthPx != screenWidthPx ||
                         activeConfig.calibratedScreenHeightPx != screenHeightPx
 
-                val acquired = acquireParsedFrameWithAutoLayout(
-                    config = activeConfig,
-                    requireStability = true,
-                    allowAutoLayout = screenChanged || !hasVerifiedLayoutForSession
-                )
-                if (acquired == null) {
-                    delay(ACTIVE_POLL_MS)
-                    continue
-                }
+                val parsed: ParsedFrame
+                var preCellColors: IntArray? = null
 
-                val parsed = acquired.first
-                val autoLayout = acquired.second
-                if (autoLayout != null) {
-                    activeConfig = autoLayout
-                    hasVerifiedLayoutForSession = true
-                    OverlayStateStore.updateRoiConfig(autoLayout)
-                    persistLayoutCalibration(autoLayout)
-                } else if (parsed is ParsedFrame.ActiveBoard) {
-                    hasVerifiedLayoutForSession = true
+                if (carryoverBoard != null && !screenChanged) {
+                    parsed = carryoverBoard
+                    preCellColors = carryoverBaselines
+                    carryoverBoard = null
+                    carryoverBaselines = null
+                } else {
+                    val acquired = acquireParsedFrameWithAutoLayout(
+                        config = activeConfig,
+                        requireStability = true,
+                        allowAutoLayout = screenChanged || !hasVerifiedLayoutForSession
+                    )
+                    if (acquired == null) {
+                        delay(ACTIVE_POLL_MS)
+                        continue
+                    }
+                    parsed = acquired.parsed
+                    preCellColors = acquired.preCellColors
+                    if (acquired.updatedConfig != null) {
+                        activeConfig = acquired.updatedConfig
+                        hasVerifiedLayoutForSession = true
+                        OverlayStateStore.updateRoiConfig(acquired.updatedConfig)
+                        persistLayoutCalibration(acquired.updatedConfig)
+                    } else if (parsed is ParsedFrame.ActiveBoard) {
+                        hasVerifiedLayoutForSession = true
+                    }
                 }
 
                 when (parsed) {
@@ -299,6 +326,7 @@ class ScreenCaptureService : Service() {
                             lockedRec = null
                             lockedActive = null
                             failedDropStreak = 0
+                            OverlayStateStore.resetComboOnNewGame()
                             OverlayStateStore.setSearching()
                         }
                         delay(IDLE_POLL_MS)
@@ -309,23 +337,49 @@ class ScreenCaptureService : Service() {
                     }
                     is ParsedFrame.ActiveBoard -> {
                         consecutiveIdleFrames = 0
+
+                        // Execute non-destructive Guided 3-Point Preview Calibration if armed
+                        if (OverlayStateStore.state.value.pendingGuidedCalibration) {
+                            if (TacticianAccessibilityService.isServiceConnected.value) {
+                                runGuidedPreviewCalibration(activeConfig, parsed, preCellColors)
+                            } else {
+                                OverlayStateStore.finishGuidedCalibration(
+                                    "Enable Accessibility Service first so Guided Calibration can probe."
+                                )
+                            }
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedRec = null
+                            lockedActive = null
+                            parser.resetStability()
+                            delay(200L)
+                            continue
+                        }
+
                         val traySig = traySignature(parsed.tray)
+                        val profile = activeConfig.globalProfile
 
                         val isUnchanged = lockedRec != null &&
+                            lockedConfig != null &&
                             parsed.boardMask == lockedBoardMask &&
                             traySig == lockedTraySig &&
-                            activeConfig == lockedConfig
+                            activeConfig.globalProfile == lockedConfig.globalProfile &&
+                            activeConfig.solverMode == lockedConfig.solverMode &&
+                            activeConfig.gridTop == lockedConfig.gridTop
 
                         val recToUse: MoveRecommendation? = if (isUnchanged) {
                             lockedRec
                         } else {
                             OverlayStateStore.setThinking(parsed.boardMask, parsed.emptyCellColorRgb)
+                            val combo = OverlayStateStore.state.value.comboState
                             val rec = withContext(Dispatchers.Default) {
                                 BitboardSolver.solve(
                                     boardMask = parsed.boardMask,
                                     tray = parsed.tray,
-                                    mode = activeConfig.solverMode,
-                                    depth = activeConfig.thinkingDepth
+                                    mode = profile.solverMode,
+                                    profile = profile,
+                                    comboStreak = combo.comboStreak,
+                                    placementsSinceClear = combo.placementsSinceClear
                                 )
                             }
                             lockedBoardMask = parsed.boardMask
@@ -348,18 +402,42 @@ class ScreenCaptureService : Service() {
                             currentState.status != ServiceStatus.PAUSED &&
                             currentState.status != ServiceStatus.STOPPED
                         ) {
-                            delay(140L)
-                            if (OverlayStateStore.state.value.status == ServiceStatus.PAUSED) {
+                            if (profile.preDragPreviewMs > 0L) {
+                                delay(profile.preDragPreviewMs)
+                            }
+                            if (OverlayStateStore.state.value.status == ServiceStatus.PAUSED ||
+                                OverlayStateStore.state.value.status == ServiceStatus.STOPPED
+                            ) {
                                 continue
                             }
+
                             OverlayStateStore.setDragging(recToUse)
-                            val dragConfig = OverlayStateStore.state.value.roiConfig
-                            val dragOk = TacticianAccessibilityService.executeAutoplayDrag(
-                                config = dragConfig,
-                                rec = recToUse,
-                                screenW = screenWidthPx,
-                                screenH = screenHeightPx
-                            )
+                            var dragConfig = OverlayStateStore.state.value.roiConfig
+                            val baselines = preCellColors
+                            val useLiveSnap = (profile.enableLivePreviewSnap || !dragConfig.isPreviewLocked) &&
+                                baselines != null
+
+                            val dragOk = if (useLiveSnap && baselines != null) {
+                                performLivePreviewSnapDrop(
+                                    config = dragConfig,
+                                    rec = recToUse,
+                                    preBoardMask = parsed.boardMask,
+                                    preCellColors = baselines,
+                                    onConfigRefined = { refined ->
+                                        dragConfig = refined
+                                        OverlayStateStore.updateRoiConfig(refined)
+                                        persistMovementCalibration(refined)
+                                    }
+                                )
+                            } else {
+                                TacticianAccessibilityService.executeAutoplayDrag(
+                                    config = dragConfig,
+                                    rec = recToUse,
+                                    screenW = screenWidthPx,
+                                    screenH = screenHeightPx
+                                )
+                            }
+
                             if (!dragOk) {
                                 failedDropStreak++
                                 if (failedDropStreak >= 3) {
@@ -368,17 +446,18 @@ class ScreenCaptureService : Service() {
                                         "Autoplay paused — touch gesture was interrupted."
                                     )
                                 }
-                                delay(350L)
+                                delay(320L)
                                 continue
                             }
 
                             OverlayStateStore.setVerifying()
-                            delay(280L)
+                            delay(profile.postDropWaitMs)
                             parser.resetStability()
 
-                            val postBoard = awaitSettledPostDropBoard(dragConfig)
+                            val settled = awaitSettledPostDropBoard(dragConfig)
                             val preActive = lockedActive
-                            if (postBoard != null && preActive != null) {
+                            if (settled != null && preActive != null) {
+                                val postBoard = settled.first
                                 when (
                                     val verdict = AutoplayMoveVerifier.verifyDrop(
                                         config = dragConfig,
@@ -397,14 +476,27 @@ class ScreenCaptureService : Service() {
                                         if (calUpdate != null) {
                                             OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
                                             persistMovementCalibration(calUpdate.updatedConfig)
-                                            OverlayStateStore.recordVerifiedMove(calUpdate.summary)
+                                            OverlayStateStore.recordVerifiedMove(
+                                                calibrationSummary = calUpdate.summary,
+                                                linesCleared = verdict.linesCleared
+                                            )
                                         } else {
-                                            OverlayStateStore.recordVerifiedMove(null)
+                                            OverlayStateStore.recordVerifiedMove(
+                                                calibrationSummary = null,
+                                                linesCleared = verdict.linesCleared
+                                            )
                                         }
+                                        carryoverBoard = postBoard
+                                        carryoverBaselines = settled.second
                                     }
                                     is DropVerificationResult.NewTurnSpawned -> {
                                         failedDropStreak = 0
-                                        OverlayStateStore.recordVerifiedMove(null)
+                                        OverlayStateStore.recordVerifiedMove(
+                                            calibrationSummary = null,
+                                            linesCleared = verdict.linesCleared
+                                        )
+                                        carryoverBoard = postBoard
+                                        carryoverBaselines = settled.second
                                     }
                                     is DropVerificationResult.NotApplied -> {
                                         failedDropStreak++
@@ -418,7 +510,7 @@ class ScreenCaptureService : Service() {
                                         if (failedDropStreak >= maxFailures) {
                                             OverlayStateStore.setPaused(
                                                 true,
-                                                "Autoplay paused — drop did not register. Adjust Drag Lift or Gain in Calibrate."
+                                                "Autoplay paused — run Guided 3-Point Calibration in Calibrate."
                                             )
                                         }
                                     }
@@ -434,6 +526,205 @@ class ScreenCaptureService : Service() {
                     }
                 }
             }
+        }
+    }
+
+    private suspend fun performLivePreviewSnapDrop(
+        config: AdaptiveRoiConfig,
+        rec: MoveRecommendation,
+        preBoardMask: Long,
+        preCellColors: IntArray,
+        onConfigRefined: suspend (AdaptiveRoiConfig) -> Unit
+    ): Boolean {
+        val profile = config.globalProfile
+        val endpoints = config.computeDragEndpoints(
+            slotIndex = rec.slotIndex,
+            targetRow = rec.targetRow,
+            targetCol = rec.targetCol,
+            pieceWidth = rec.piece.width,
+            pieceHeight = rec.piece.height,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx
+        )
+
+        val hold = TacticianAccessibilityService.beginHoldDrag(
+            startX = endpoints.startX,
+            startY = endpoints.startY,
+            toX = endpoints.endX,
+            toY = endpoints.endY,
+            pressMs = profile.pressDurationMs,
+            glideMs = profile.glideDurationMs
+        ) ?: return false
+
+        // MediaProjection 60Hz only needs ~45ms for the game render frame to show the ghost shadow
+        delay(45L)
+        val snap = acquireSnapshotFrame(config)
+        if (snap != null) {
+            val match = withContext(Dispatchers.Default) {
+                PreviewHoverDetector.detectHoveredPreview(
+                    hoverFrame = snap.pixelFrame,
+                    width = snap.width,
+                    height = snap.height,
+                    config = config,
+                    preBoardMask = preBoardMask,
+                    preCellColors = preCellColors,
+                    piece = rec.piece
+                )
+            }
+            if (match != null && (match.row != rec.targetRow || match.col != rec.targetCol)) {
+                val safeGainX = config.dragHorizontalGain.coerceIn(0.65f, 1.50f)
+                val safeGainY = config.dragVerticalGain.coerceIn(0.65f, 2.00f)
+                val errRow = match.row - rec.targetRow
+                val errCol = match.col - rec.targetCol
+
+                val correctedX = (hold.currentX - (errCol * endpoints.cellWidthPx) / safeGainX)
+                    .coerceIn(endpoints.cellWidthPx * 0.3f, screenWidthPx - endpoints.cellWidthPx * 0.3f)
+                val correctedY = (hold.currentY - (errRow * endpoints.cellHeightPx) / safeGainY)
+                    .coerceIn(endpoints.cellHeightPx * 0.35f, screenHeightPx - 32f)
+
+                TacticianAccessibilityService.nudgeHoldDrag(hold, correctedX, correctedY, durationMs = 70L)
+                val refined = AutoplayMoveVerifier.adjustFromSingleHoverObservation(
+                    config = config,
+                    screenWidthPx = screenWidthPx,
+                    screenHeightPx = screenHeightPx,
+                    targetRow = rec.targetRow,
+                    targetCol = rec.targetCol,
+                    observedRow = match.row,
+                    observedCol = match.col
+                )
+                onConfigRefined(refined)
+            }
+        }
+
+        return TacticianAccessibilityService.releaseHoldDrag(hold, profile.settleDurationMs)
+    }
+
+    private suspend fun runGuidedPreviewCalibration(
+        config: AdaptiveRoiConfig,
+        parsed: ParsedFrame.ActiveBoard,
+        initialBaselines: IntArray?
+    ) {
+        val plan = PreviewHoverDetector.selectGuidedCalibrationPlan(parsed.boardMask, parsed.tray)
+        if (plan == null) {
+            OverlayStateStore.finishGuidedCalibration("Need open cells on board for Guided Calibration.")
+            return
+        }
+
+        val baselines = initialBaselines ?: run {
+            val snap = acquireSnapshotFrame(config)
+            if (snap != null) {
+                PreviewHoverDetector.captureCellBaselines(snap.pixelFrame, snap.width, snap.height, config)
+            } else {
+                null
+            }
+        }
+        if (baselines == null) {
+            OverlayStateStore.finishGuidedCalibration("Unable to read frame for Guided Calibration.")
+            return
+        }
+
+        val firstAnchor = plan.anchors.first()
+        val firstEndpoints = config.computeDragEndpoints(
+            slotIndex = plan.slotIndex,
+            targetRow = firstAnchor.first,
+            targetCol = firstAnchor.second,
+            pieceWidth = plan.piece.width,
+            pieceHeight = plan.piece.height,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx
+        )
+        val startX = firstEndpoints.startX
+        val startY = firstEndpoints.startY
+
+        OverlayStateStore.setCalibratingStep(1, "Calibrating Point 1/${plan.anchors.size} (reading preview)…")
+        val hold = TacticianAccessibilityService.beginHoldDrag(
+            startX = startX,
+            startY = startY,
+            toX = firstEndpoints.endX,
+            toY = firstEndpoints.endY,
+            pressMs = 45L,
+            glideMs = 230L
+        )
+        if (hold == null) {
+            OverlayStateStore.finishGuidedCalibration("Guided Calibration canceled — touch interrupted.")
+            return
+        }
+
+        val collectedSamples = ArrayList<PreviewCalibrationSample>(plan.anchors.size)
+        try {
+            for ((idx, anchor) in plan.anchors.withIndex()) {
+                if (idx > 0) {
+                    OverlayStateStore.setCalibratingStep(
+                        idx + 1,
+                        "Calibrating Point ${idx + 1}/${plan.anchors.size} (measuring offset)…"
+                    )
+                    val ep = config.computeDragEndpoints(
+                        slotIndex = plan.slotIndex,
+                        targetRow = anchor.first,
+                        targetCol = anchor.second,
+                        pieceWidth = plan.piece.width,
+                        pieceHeight = plan.piece.height,
+                        screenWidthPx = screenWidthPx,
+                        screenHeightPx = screenHeightPx
+                    )
+                    if (!TacticianAccessibilityService.nudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 190L)) break
+                }
+
+                delay(65L)
+                val snap = acquireSnapshotFrame(config)
+                if (snap != null) {
+                    val match = withContext(Dispatchers.Default) {
+                        PreviewHoverDetector.detectHoveredPreview(
+                            hoverFrame = snap.pixelFrame,
+                            width = snap.width,
+                            height = snap.height,
+                            config = config,
+                            preBoardMask = parsed.boardMask,
+                            preCellColors = baselines,
+                            piece = plan.piece
+                        )
+                    }
+                    if (match != null) {
+                        collectedSamples.add(
+                            PreviewCalibrationSample(
+                                slotIndex = plan.slotIndex,
+                                startX = startX,
+                                startY = startY,
+                                fingerX = hold.currentX,
+                                fingerY = hold.currentY,
+                                observedRow = match.row,
+                                observedCol = match.col,
+                                pieceWidth = plan.piece.width,
+                                pieceHeight = plan.piece.height
+                            )
+                        )
+                    }
+                }
+            }
+        } finally {
+            TacticianAccessibilityService.nudgeHoldDrag(hold, startX, startY, durationMs = 200L)
+            TacticianAccessibilityService.releaseHoldDrag(hold, settleMs = 45L)
+        }
+
+        val calUpdate = if (collectedSamples.size >= 2) {
+            AutoplayMoveVerifier.fitAffineFromPreviewSamples(
+                config = config,
+                screenWidthPx = screenWidthPx,
+                screenHeightPx = screenHeightPx,
+                samples = collectedSamples
+            )
+        } else {
+            null
+        }
+
+        if (calUpdate != null) {
+            OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
+            persistMovementCalibration(calUpdate.updatedConfig)
+            OverlayStateStore.finishGuidedCalibration(calUpdate.summary)
+        } else {
+            OverlayStateStore.finishGuidedCalibration(
+                "Need 2+ open preview spots to calibrate — pause & retry on cleaner board."
+            )
         }
     }
 
@@ -462,32 +753,70 @@ class ScreenCaptureService : Service() {
             current.copy(
                 dragLiftOffsetCells = calibrated.dragLiftOffsetCells,
                 dragVerticalGain = calibrated.dragVerticalGain,
+                dragHorizontalOffsetCells = calibrated.dragHorizontalOffsetCells,
                 dragHorizontalGain = calibrated.dragHorizontalGain,
                 calibratedScreenWidthPx = calibrated.calibratedScreenWidthPx,
                 calibratedScreenHeightPx = calibrated.calibratedScreenHeightPx,
-                dragCalibrationSamples = calibrated.dragCalibrationSamples
+                dragCalibrationSamples = calibrated.dragCalibrationSamples,
+                isPreviewLocked = calibrated.isPreviewLocked
             )
         }
     }
 
-    private suspend fun awaitSettledPostDropBoard(config: AdaptiveRoiConfig): ParsedFrame.ActiveBoard? {
+    private suspend fun awaitSettledPostDropBoard(
+        config: AdaptiveRoiConfig
+    ): Pair<ParsedFrame.ActiveBoard, IntArray?>? {
         for (attempt in 0 until 5) {
-            val frame = acquireParsedFrameWithAutoLayout(
+            val acquired = acquireParsedFrameWithAutoLayout(
                 config = config,
                 requireStability = false,
                 allowAutoLayout = false
-            )?.first
-            if (frame is ParsedFrame.ActiveBoard) return frame
-            delay(180L)
+            )
+            if (acquired != null && acquired.parsed is ParsedFrame.ActiveBoard) {
+                return acquired.parsed to acquired.preCellColors
+            }
+            delay(160L)
         }
         return null
+    }
+
+    private fun acquireSnapshotFrame(config: AdaptiveRoiConfig): SnapshotFrame? {
+        val reader = imageReader ?: return null
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return null
+
+        return try {
+            val w = image.width
+            val h = image.height
+            val plane = image.planes[0]
+            val src = ByteBufferPixelFrame(
+                buffer = plane.buffer,
+                width = w,
+                height = h,
+                pixelStride = plane.pixelStride,
+                rowStride = plane.rowStride
+            )
+            val pixels = IntArray(w * h)
+            for (y in 0 until h) {
+                val rowOff = y * w
+                for (x in 0 until w) {
+                    pixels[rowOff + x] = src.pixelAt(x, y)
+                }
+            }
+            SnapshotFrame(IntArrayPixelFrame(pixels, w, h), w, h)
+        } finally {
+            image.close()
+        }
     }
 
     private fun acquireParsedFrameWithAutoLayout(
         config: AdaptiveRoiConfig,
         requireStability: Boolean,
         allowAutoLayout: Boolean
-    ): Pair<ParsedFrame, AdaptiveRoiConfig?>? {
+    ): AcquiredParsedFrame? {
         val reader = imageReader ?: return null
         val image = try {
             reader.acquireLatestImage()
@@ -536,7 +865,17 @@ class ScreenCaptureService : Service() {
                     )
                 }
             }
-            parsed to updatedCfg
+            val baselines = if (parsed is ParsedFrame.ActiveBoard) {
+                PreviewHoverDetector.captureCellBaselines(
+                    frame = frame,
+                    width = image.width,
+                    height = image.height,
+                    config = updatedCfg ?: config
+                )
+            } else {
+                null
+            }
+            AcquiredParsedFrame(parsed, updatedCfg, baselines)
         } finally {
             image.close()
         }

@@ -1,15 +1,20 @@
 package com.example
 
+import com.example.data.ComboState
+import com.example.data.ComboTracker
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.AdaptiveScreenParser
 import com.example.engine.AutoLayoutCalibrator
 import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
 import com.example.engine.DropVerificationResult
+import com.example.engine.GlobalProfile
 import com.example.engine.IntArrayPixelFrame
 import com.example.engine.MoveRecommendation
 import com.example.engine.ParsedFrame
 import com.example.engine.PieceCatalog
+import com.example.engine.PreviewCalibrationSample
+import com.example.engine.PreviewHoverDetector
 import com.example.engine.SolverMode
 import com.example.engine.ThinkingDepth
 import com.example.engine.TraySlotState
@@ -613,5 +618,205 @@ class VisionAndSolverTest {
         )
         assertEquals(1080, adapted169.calibratedScreenWidthPx)
         assertEquals(1920, adapted169.calibratedScreenHeightPx)
+    }
+
+    @Test
+    fun `combo tracker increments on clears and resets after 3 non-clearing placements`() {
+        var state = ComboTracker.reset()
+        state = ComboTracker.onPlacementCleared(state, 1)
+        assertEquals(1, state.comboStreak)
+        assertEquals(0, state.placementsSinceClear)
+
+        state = ComboTracker.onPlacementCleared(state, 0)
+        assertEquals(1, state.comboStreak)
+        assertEquals(1, state.placementsSinceClear)
+
+        state = ComboTracker.onPlacementCleared(state, 0)
+        assertEquals(1, state.comboStreak)
+        assertEquals(2, state.placementsSinceClear)
+
+        // Clearing on the 3rd gap extends the combo streak!
+        state = ComboTracker.onPlacementCleared(state, 2)
+        assertEquals(2, state.comboStreak)
+        assertEquals(0, state.placementsSinceClear)
+        assertEquals(3, state.totalLinesCleared)
+
+        // 3 consecutive non-clearing placements reset active streak
+        state = ComboTracker.onPlacementCleared(state, 0)
+        state = ComboTracker.onPlacementCleared(state, 0)
+        assertEquals(2, state.comboStreak)
+        state = ComboTracker.onPlacementCleared(state, 0)
+        assertEquals(0, state.comboStreak)
+    }
+
+    @Test
+    fun `global profiles adapt compute budget and protect active combo streak`() {
+        // Row 7 has 7 occupied cells (cols 0..6); dot_1x1 at (7,7) saves a combo streak at placementsSinceClear=2
+        var board = 0L
+        for (c in 0 until 7) board = board or (1L shl (7 * 8 + c))
+        val tray = listOf(
+            TraySlotState.Recognized(0, PieceCatalog.BY_ID.getValue("sq_2x2")),
+            TraySlotState.Recognized(1, PieceCatalog.BY_ID.getValue("dot_1x1")),
+            TraySlotState.Recognized(2, PieceCatalog.BY_ID.getValue("bar_1x3"))
+        )
+
+        val comboRec = BitboardSolver.solve(
+            boardMask = board,
+            tray = tray,
+            profile = GlobalProfile.MAX_COMBOS_SCORE,
+            comboStreak = 5,
+            placementsSinceClear = 2
+        )
+        assertNotNull(comboRec)
+        assertTrue(
+            "Expected Max Combos/Score with streak=5 at gap=2 to clear the saving line cleanly",
+            comboRec!!.fullPlan.any { it.linesCleared > 0 }
+        )
+
+        val fastRec = BitboardSolver.solve(
+            boardMask = board,
+            tray = tray,
+            profile = GlobalProfile.FASTEST_SPEED,
+            comboStreak = 0,
+            placementsSinceClear = 0
+        )
+        assertNotNull(fastRec)
+        assertTrue(
+            "Fastest Speed open-board bitwise solve should be very quick (took ${fastRec!!.solveTimeMs}ms)",
+            fastRec.solveTimeMs <= 80L
+        )
+    }
+
+    @Test
+    fun `preview hover detector locates translucent ghost preview cells and selects 3 anchors`() {
+        val img = ImageIO.read(resolveAttachment("Screenshot_20261123_235903_com_blockblast_lite_AppActivity_f51f6358.jpg"))
+        val w = img.width
+        val h = img.height
+        val rawPixels = img.getRGB(0, 0, w, h, null, 0, w)
+        val cfg = AdaptiveRoiConfig()
+
+        val baseFrame = IntArrayPixelFrame(rawPixels, w, h)
+        val parsed = AdaptiveScreenParser().parse(baseFrame, w, h, cfg, requireStability = false) as ParsedFrame.ActiveBoard
+        val baselines = PreviewHoverDetector.captureCellBaselines(baseFrame, w, h, cfg)
+
+        // Blend a translucent cyan/green ghost preview over piece sq_2x2 at (row=3, col=4)
+        val hoverPixels = rawPixels.copyOf()
+        val sq2x2 = PieceCatalog.BY_ID.getValue("sq_2x2")
+        val targetRow = 3
+        val targetCol = 4
+        val cellWPx = cfg.cellWidth() * w
+        val cellHPx = cfg.cellHeight() * h
+
+        for ((dr, dc) in sq2x2.cells()) {
+            val cx = (cfg.cellCenterX(targetCol + dc) * w).toInt()
+            val cy = (cfg.cellCenterY(targetRow + dr) * h).toInt()
+            val hw = (cellWPx * 0.35f).toInt()
+            val hh = (cellHPx * 0.35f).toInt()
+            for (y in (cy - hh)..(cy + hh)) {
+                for (x in (cx - hw)..(cx + hw)) {
+                    val orig = hoverPixels[y * w + x]
+                    val nr = (((orig ushr 16) and 0xFF) * 0.5f + 220 * 0.5f).toInt()
+                    val ng = (((orig ushr 8) and 0xFF) * 0.5f + 195 * 0.5f).toInt()
+                    val nb = ((orig and 0xFF) * 0.5f + 75 * 0.5f).toInt()
+                    hoverPixels[y * w + x] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                }
+            }
+        }
+
+        val match = PreviewHoverDetector.detectHoveredPreview(
+            hoverFrame = IntArrayPixelFrame(hoverPixels, w, h),
+            width = w,
+            height = h,
+            config = cfg,
+            preBoardMask = parsed.boardMask,
+            preCellColors = baselines,
+            piece = sq2x2
+        )
+        assertNotNull("Expected PreviewHoverDetector to detect ghost footprint", match)
+        assertEquals(targetRow, match!!.row)
+        assertEquals(targetCol, match.col)
+        assertTrue("Expected high confidence match, got ${match.confidence}", match.confidence >= 0.8f)
+
+        val plan = PreviewHoverDetector.selectGuidedCalibrationPlan(parsed.boardMask, parsed.tray)
+        assertNotNull(plan)
+        assertEquals(3, plan!!.anchors.size)
+    }
+
+    @Test
+    fun `guided 3-point OLS preview calibration recovers exact 4-param affine kinematics`() {
+        val screenW = 1080
+        val screenH = 2400
+        val trueLift = 2.85f
+        val trueGainY = 1.28f
+        val trueOffX = -0.35f
+        val trueGainX = 1.09f
+
+        val baseCfg = AdaptiveRoiConfig()
+        val piece = PieceCatalog.BY_ID.getValue("sq_2x2")
+        val anchors = listOf(6 to 1, 4 to 5, 2 to 2)
+        val samples = ArrayList<PreviewCalibrationSample>()
+
+        val cellWPx = baseCfg.cellWidth() * screenW
+        val cellHPx = baseCfg.cellHeight() * screenH
+
+        for ((r, c) in anchors) {
+            val ep = baseCfg.computeDragEndpoints(
+                slotIndex = 0,
+                targetRow = r,
+                targetCol = c,
+                pieceWidth = piece.width,
+                pieceHeight = piece.height,
+                screenWidthPx = screenW,
+                screenHeightPx = screenH
+            )
+            // Forward physics of game piece center given finger (ep.endX, ep.endY)
+            val obsCenterX = ep.startX + trueGainX * (ep.endX - ep.startX) - trueOffX * cellWPx
+            val obsCenterY = ep.startY + trueGainY * (ep.endY - ep.startY) - trueLift * cellHPx
+
+            val obsCol = kotlin.math.round((obsCenterX - baseCfg.gridLeft * screenW) / cellWPx - piece.width * 0.5f)
+                .toInt()
+                .coerceIn(0, 8 - piece.width)
+            val obsRow = kotlin.math.round((obsCenterY - baseCfg.gridTop * screenH) / cellHPx - piece.height * 0.5f)
+                .toInt()
+                .coerceIn(0, 8 - piece.height)
+
+            samples.add(
+                PreviewCalibrationSample(
+                    slotIndex = 0,
+                    startX = ep.startX,
+                    startY = ep.startY,
+                    fingerX = ep.endX,
+                    fingerY = ep.endY,
+                    observedRow = obsRow,
+                    observedCol = obsCol,
+                    pieceWidth = piece.width,
+                    pieceHeight = piece.height
+                )
+            )
+        }
+
+        val cal = AutoplayMoveVerifier.fitAffineFromPreviewSamples(baseCfg, screenW, screenH, samples)
+        assertNotNull(cal)
+        val locked = cal!!.updatedConfig
+        assertTrue(locked.isPreviewLocked)
+
+        // Verify fitted config now places arbitrary targets onto exact row/col with 0 cell error
+        for ((testSlot, target) in listOf(0 to (2 to 5), 2 to (5 to 1))) {
+            val ep = locked.computeDragEndpoints(
+                slotIndex = testSlot,
+                targetRow = target.first,
+                targetCol = target.second,
+                pieceWidth = piece.width,
+                pieceHeight = piece.height,
+                screenWidthPx = screenW,
+                screenHeightPx = screenH
+            )
+            val landedCenterX = ep.startX + trueGainX * (ep.endX - ep.startX) - trueOffX * cellWPx
+            val landedCenterY = ep.startY + trueGainY * (ep.endY - ep.startY) - trueLift * cellHPx
+            val landedCol = kotlin.math.round((landedCenterX - locked.gridLeft * screenW) / cellWPx - piece.width * 0.5f).toInt()
+            val landedRow = kotlin.math.round((landedCenterY - locked.gridTop * screenH) / cellHPx - piece.height * 0.5f).toInt()
+            assertEquals("Row should snap exact after 3-point preview lock", target.first, landedRow)
+            assertEquals("Col should snap exact after 3-point preview lock", target.second, landedCol)
+        }
     }
 }
