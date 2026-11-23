@@ -166,20 +166,37 @@ class AdaptiveScreenParser {
     ): Long {
         var hash = -3750763034362895579L // FNV-1a offset basis
         val prime = 1099511628211L
-        val yStart = config.gridTop
-        val yEnd = config.trayBottom
-        for (gy in 0 until 12) {
-            val ny = yStart + (gy + 0.5f) / 12f * (yEnd - yStart)
-            val py = (ny * height).roundToInt()
-            for (gx in 0 until 12) {
-                val nx = config.gridLeft + (gx + 0.5f) / 12f * (config.gridRight - config.gridLeft)
-                val px = (nx * width).roundToInt()
+
+        // Sample strictly the 64 board cell centers (untouched by hollow perimeter overlays)
+        for (r in 0 until 8) {
+            val py = (config.cellCenterY(r) * height).roundToInt()
+            for (c in 0 until 8) {
+                val px = (config.cellCenterX(c) * width).roundToInt()
                 val rgb = frame.pixelAt(px, py)
-                // Bucket each channel to multiples of 16 to ignore sub-pixel / video compression jitter
                 val bucket = (((rgb ushr 16) and 0xF0) shl 4) or
-                    (((rgb ushr 8) and 0xF0)) or
+                    ((rgb ushr 8) and 0xF0) or
                     ((rgb and 0xF0) ushr 4)
                 hash = (hash xor bucket.toLong()) * prime
+            }
+        }
+
+        // Sample strictly inside the 3 tray slot interiors (untouched by badges outside trayBottom)
+        for (slotIdx in 0..2) {
+            val bounds = config.traySlotBounds(slotIdx)
+            val x0 = (bounds.left * width).roundToInt()
+            val w = ((bounds.right - bounds.left) * width).roundToInt().coerceAtLeast(1)
+            val y0 = (bounds.top * height).roundToInt()
+            val h = ((bounds.bottom - bounds.top) * height).roundToInt().coerceAtLeast(1)
+            for (gy in 1..4) {
+                val py = y0 + (gy * h) / 5
+                for (gx in 1..4) {
+                    val px = x0 + (gx * w) / 5
+                    val rgb = frame.pixelAt(px, py)
+                    val bucket = (((rgb ushr 16) and 0xF0) shl 4) or
+                        ((rgb ushr 8) and 0xF0) or
+                        ((rgb and 0xF0) ushr 4)
+                    hash = (hash xor bucket.toLong()) * prime
+                }
             }
         }
         return hash
@@ -325,8 +342,11 @@ class AdaptiveScreenParser {
             bgSamples.add(frame.pixelAt(x1 - 2, sy))
         }
         val bgRgb = medianColor(bgSamples)
+        val bgR = (bgRgb ushr 16) and 0xFF
+        val bgG = (bgRgb ushr 8) and 0xFF
+        val bgB = bgRgb and 0xFF
         val bgSat = saturationOf(bgRgb)
-        val bgLum = luminanceOf(bgRgb)
+        val bgLum = max(1f, luminanceOf(bgRgb))
 
         // Dense 32x32 grid sampling inside the slot
         val gridN = 32
@@ -344,17 +364,27 @@ class AdaptiveScreenParser {
                 val rgb = frame.pixelAt(px, py)
                 val dist = rgbDistance(rgb, bgRgb)
                 val sat = saturationOf(rgb)
+                val satDelta = abs(sat - bgSat)
                 val lum = luminanceOf(rgb)
 
-                // Reject subtle gray/dark drop shadows while keeping vibrant block faces & bevels
+                // Multiplicative drop-shadow residual: shadows darken bgRgb proportionally (k * bgRgb),
+                // whereas same-hue blocks (e.g. bright red block on coral-red bg) shift chromaticity strongly.
+                val k = (lum / bgLum).coerceIn(0.48f, 1.0f)
+                val sdr = ((rgb ushr 16) and 0xFF) - bgR * k
+                val sdg = ((rgb ushr 8) and 0xFF) - bgG * k
+                val sdb = (rgb and 0xFF) - bgB * k
+                val shadowResidual = sqrt(sdr * sdr + sdg * sdg + sdb * sdb)
+
                 val isShadowLike = (lum < bgLum) &&
-                    (abs(sat - bgSat) < 0.14f) &&
-                    (sat < 0.55f) &&
-                    (dist < 78f)
+                    (lum >= bgLum * 0.48f) &&
+                    (shadowResidual < 20f) &&
+                    (satDelta < 0.14f) &&
+                    (dist < 82f)
 
                 val isForeground = !isShadowLike && (
-                    dist > 54f ||
-                        (abs(sat - bgSat) > 0.30f && dist > 32f)
+                    dist > 46f ||
+                        (shadowResidual > 20f && dist > 26f) ||
+                        (satDelta > 0.20f && dist > 26f)
                     )
 
                 if (isForeground) {

@@ -1,13 +1,8 @@
 package com.example.overlay
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -49,9 +44,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -76,6 +70,9 @@ import kotlin.math.roundToInt
 /**
  * Click-through Material 3 Expressive overlay that renders ONLY the single next best move
  * directly over the active Block Blast Lite 8x8 board and highlights its tray slot.
+ *
+ * Rendering uses a hollow outer-perimeter silhouette + below-tray indicator so cell centers
+ * and tray interiors remain 100% unobstructed for both the player and MediaProjection parsing.
  */
 @Composable
 fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
@@ -84,17 +81,6 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
         val showOverlay = runtimeState.status == ServiceStatus.GUIDING && rec != null
         val config = runtimeState.roiConfig
         val opacity = config.overlayOpacity.coerceIn(0.35f, 1f)
-
-        val infiniteTransition = rememberInfiniteTransition(label = "mint_pulse")
-        val pulse by infiniteTransition.animateFloat(
-            initialValue = 0.72f,
-            targetValue = 1.0f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(900, easing = FastOutSlowInEasing),
-                repeatMode = RepeatMode.Reverse
-            ),
-            label = "pulse_alpha"
-        )
 
         AnimatedVisibility(
             visible = showOverlay,
@@ -122,6 +108,8 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
                     label = "target_col"
                 )
 
+                val occupiedCells = remember(rec.piece) { rec.piece.cells().toSet() }
+
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                     val widthPx = constraints.maxWidth.toFloat()
                     val heightPx = constraints.maxHeight.toFloat()
@@ -134,75 +122,167 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
 
                     val slotBounds = config.traySlotBounds(rec.slotIndex)
                     val slotCenterX = ((slotBounds.left + slotBounds.right) * 0.5f) * widthPx
-                    val slotTopY = slotBounds.top * heightPx
-
-                    val targetCenterX = gridLeftPx + (animCol + rec.piece.width * 0.5f) * cellWPx
-                    val targetCenterY = gridTopPx + (animRow + rec.piece.height * 0.5f) * cellHPx
+                    val trayBottomPx = config.trayBottom * heightPx
 
                     Canvas(modifier = Modifier.fillMaxSize()) {
-                        val inset = cellWPx * 0.08f
-                        val corner = CornerRadius(cellWPx * 0.24f, cellWPx * 0.24f)
+                        // Keep strokes strictly in the outer 12% border of each cell so the
+                        // parser's inner cell-center patch and divider scans remain untouched.
+                        val insetX = cellWPx * 0.11f
+                        val insetY = cellHPx * 0.11f
+                        val outerCasingWidth = 6.dp.toPx()
+                        val innerMintWidth = 3.5.dp.toPx()
+                        val cornerPadX = cellWPx * 0.10f
+                        val cornerPadY = cellHPx * 0.10f
 
-                        // Soft connector line from tray slot to target footprint center
-                        drawLine(
-                            brush = Brush.verticalGradient(
-                                colors = listOf(
-                                    MintSurge.copy(alpha = 0.12f * opacity),
-                                    MintSurge.copy(alpha = 0.42f * opacity * pulse)
-                                ),
-                                startY = slotTopY,
-                                endY = targetCenterY
-                            ),
-                            start = Offset(slotCenterX, slotTopY - 12f),
-                            end = Offset(targetCenterX, targetCenterY),
-                            strokeWidth = 4f
-                        )
+                        for ((dr, dc) in occupiedCells) {
+                            val cellLeft = gridLeftPx + (animCol + dc) * cellWPx
+                            val cellTop = gridTopPx + (animRow + dr) * cellHPx
+                            val cellRight = cellLeft + cellWPx
+                            val cellBottom = cellTop + cellHPx
 
-                        for ((dr, dc) in rec.piece.cells()) {
-                            val left = gridLeftPx + (animCol + dc) * cellWPx + inset
-                            val top = gridTopPx + (animRow + dr) * cellHPx + inset
-                            val w = cellWPx - inset * 2f
-                            val h = cellHPx - inset * 2f
+                            val hasTop = (dr - 1 to dc) in occupiedCells
+                            val hasBottom = (dr + 1 to dc) in occupiedCells
+                            val hasLeft = (dr to dc - 1) in occupiedCells
+                            val hasRight = (dr to dc + 1) in occupiedCells
 
-                            // Outer ambient glow
-                            drawRoundRect(
-                                color = MintSurge.copy(alpha = 0.18f * opacity * pulse),
-                                topLeft = Offset(left - 5f, top - 5f),
-                                size = Size(w + 10f, h + 10f),
-                                cornerRadius = CornerRadius(corner.x + 4f, corner.y + 4f)
-                            )
+                            // Top outer boundary
+                            if (!hasTop) {
+                                val y = cellTop + insetY
+                                val startX = if (hasLeft) cellLeft else cellLeft + insetX
+                                val endX = if (hasRight) cellRight else cellRight - insetX
+                                drawLine(
+                                    color = SlateSurfaceDark.copy(alpha = 0.72f * opacity),
+                                    start = Offset(startX, y),
+                                    end = Offset(endX, y),
+                                    strokeWidth = outerCasingWidth,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = MintSurge.copy(alpha = 0.96f * opacity),
+                                    start = Offset(startX, y),
+                                    end = Offset(endX, y),
+                                    strokeWidth = innerMintWidth,
+                                    cap = StrokeCap.Round
+                                )
+                            }
 
-                            // Expressive Mint Surge translucent fill
-                            drawRoundRect(
-                                color = MintSurge.copy(alpha = 0.34f * opacity),
-                                topLeft = Offset(left, top),
-                                size = Size(w, h),
-                                cornerRadius = corner
-                            )
+                            // Bottom outer boundary
+                            if (!hasBottom) {
+                                val y = cellBottom - insetY
+                                val startX = if (hasLeft) cellLeft else cellLeft + insetX
+                                val endX = if (hasRight) cellRight else cellRight - insetX
+                                drawLine(
+                                    color = SlateSurfaceDark.copy(alpha = 0.72f * opacity),
+                                    start = Offset(startX, y),
+                                    end = Offset(endX, y),
+                                    strokeWidth = outerCasingWidth,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = MintSurge.copy(alpha = 0.96f * opacity),
+                                    start = Offset(startX, y),
+                                    end = Offset(endX, y),
+                                    strokeWidth = innerMintWidth,
+                                    cap = StrokeCap.Round
+                                )
+                            }
 
-                            // Crisp luminous border
-                            drawRoundRect(
-                                color = MintSurge.copy(alpha = 0.96f * opacity),
-                                topLeft = Offset(left, top),
-                                size = Size(w, h),
-                                cornerRadius = corner,
-                                style = Stroke(width = 5.5f)
-                            )
+                            // Left outer boundary
+                            if (!hasLeft) {
+                                val x = cellLeft + insetX
+                                val startY = if (hasTop) cellTop else cellTop + insetY
+                                val endY = if (hasBottom) cellBottom else cellBottom - insetY
+                                drawLine(
+                                    color = SlateSurfaceDark.copy(alpha = 0.72f * opacity),
+                                    start = Offset(x, startY),
+                                    end = Offset(x, endY),
+                                    strokeWidth = outerCasingWidth,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = MintSurge.copy(alpha = 0.96f * opacity),
+                                    start = Offset(x, startY),
+                                    end = Offset(x, endY),
+                                    strokeWidth = innerMintWidth,
+                                    cap = StrokeCap.Round
+                                )
+                            }
+
+                            // Right outer boundary
+                            if (!hasRight) {
+                                val x = cellRight - insetX
+                                val startY = if (hasTop) cellTop else cellTop + insetY
+                                val endY = if (hasBottom) cellBottom else cellBottom - insetY
+                                drawLine(
+                                    color = SlateSurfaceDark.copy(alpha = 0.72f * opacity),
+                                    start = Offset(x, startY),
+                                    end = Offset(x, endY),
+                                    strokeWidth = outerCasingWidth,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = MintSurge.copy(alpha = 0.96f * opacity),
+                                    start = Offset(x, startY),
+                                    end = Offset(x, endY),
+                                    strokeWidth = innerMintWidth,
+                                    cap = StrokeCap.Round
+                                )
+                            }
+
+                            // Subtle bright corner dots on convex outer corners for quick visual lock
+                            val dotRadius = 2.4.dp.toPx()
+                            if (!hasTop && !hasLeft) {
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.9f * opacity),
+                                    radius = dotRadius,
+                                    center = Offset(cellLeft + cornerPadX, cellTop + cornerPadY)
+                                )
+                            }
+                            if (!hasTop && !hasRight) {
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.9f * opacity),
+                                    radius = dotRadius,
+                                    center = Offset(cellRight - cornerPadX, cellTop + cornerPadY)
+                                )
+                            }
+                            if (!hasBottom && !hasLeft) {
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.9f * opacity),
+                                    radius = dotRadius,
+                                    center = Offset(cellLeft + cornerPadX, cellBottom - cornerPadY)
+                                )
+                            }
+                            if (!hasBottom && !hasRight) {
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.9f * opacity),
+                                    radius = dotRadius,
+                                    center = Offset(cellRight - cornerPadX, cellBottom - cornerPadY)
+                                )
+                            }
                         }
 
-                        // Subtle ring around source tray slot
-                        drawCircle(
-                            color = MintSurge.copy(alpha = 0.25f * opacity * pulse),
-                            radius = cellWPx * 0.52f,
-                            center = Offset(slotCenterX, (slotBounds.top + slotBounds.bottom) * 0.5f * heightPx),
-                            style = Stroke(width = 4f)
+                        // Sleek underline bar strictly below trayBottom (zero interference with tray slot)
+                        val barWidth = cellWPx * 1.15f
+                        val barHeight = 3.5.dp.toPx()
+                        val barTop = (trayBottomPx + 3.dp.toPx()).coerceAtMost(heightPx - 64.dp.toPx())
+                        drawRoundRect(
+                            color = MintSurge.copy(alpha = 0.94f * opacity),
+                            topLeft = Offset(slotCenterX - barWidth / 2f, barTop),
+                            size = Size(barWidth, barHeight),
+                            cornerRadius = CornerRadius(barHeight / 2f, barHeight / 2f)
                         )
                     }
 
-                    // Compact M3 Expressive "NEXT" pill centered dynamically above the chosen tray slot
+                    // Compact M3 Expressive "NEXT" pill placed strictly BELOW trayBottom
                     var badgeWidthPx by remember { mutableIntStateOf(0) }
-                    val badgeX = (slotCenterX - badgeWidthPx / 2f).roundToInt()
-                    val badgeY = with(density) { (slotTopY - 26.dp.toPx()).roundToInt() }
+                    val badgeX = (slotCenterX - badgeWidthPx / 2f)
+                        .coerceIn(8f, (widthPx - badgeWidthPx - 8f).coerceAtLeast(8f))
+                        .roundToInt()
+                    val badgeY = with(density) {
+                        (trayBottomPx + 10.dp.toPx())
+                            .coerceAtMost(heightPx - 56.dp.toPx())
+                            .roundToInt()
+                    }
 
                     Surface(
                         modifier = Modifier
@@ -210,13 +290,14 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
                             .onSizeChanged { badgeWidthPx = it.width }
                             .testTag("overlay_next_badge"),
                         shape = RoundedCornerShape(50),
-                        color = MintSurge.copy(alpha = 0.95f * opacity),
+                        color = MintSurge.copy(alpha = 0.96f * opacity),
+                        border = BorderStroke(1.5.dp, SlateSurfaceDark.copy(alpha = 0.85f)),
                         shadowElevation = 6.dp
                     ) {
                         val badgeLabel = if (rec.linesCleared > 0) {
-                            "${stringResource(R.string.overlay_next_badge)} • ×${rec.linesCleared}"
+                            "▲ ${stringResource(R.string.overlay_next_badge)} • ×${rec.linesCleared}"
                         } else {
-                            stringResource(R.string.overlay_next_badge)
+                            "▲ ${stringResource(R.string.overlay_next_badge)}"
                         }
                         Text(
                             text = badgeLabel,

@@ -229,9 +229,12 @@ class ScreenCaptureService : Service() {
     private fun startPollingLoop() {
         pollJob?.cancel()
         pollJob = serviceScope.launch {
-            var lastBoardMask = -1L
-            var lastTraySig = ""
-            var lastConfig: com.example.engine.AdaptiveRoiConfig? = null
+            var lockedBoardMask = -1L
+            var lockedTraySig = ""
+            var lockedConfig: com.example.engine.AdaptiveRoiConfig? = null
+            var lockedRec: com.example.engine.MoveRecommendation? = null
+            var consecutiveIdleFrames = 0
+
             while (isActive) {
                 val state = OverlayStateStore.state.value
                 if (state.status == ServiceStatus.PAUSED || !isContentVisible) {
@@ -278,34 +281,48 @@ class ScreenCaptureService : Service() {
 
                 when (parsed) {
                     is ParsedFrame.IdleOrMenu -> {
-                        lastBoardMask = -1L
-                        lastTraySig = ""
-                        lastConfig = null
-                        OverlayStateStore.setSearching()
+                        consecutiveIdleFrames++
+                        // Require 3 consecutive idle frames before clearing an active recommendation
+                        // so transient UI flashes or particle bursts never flicker the overlay.
+                        if (lockedRec == null || consecutiveIdleFrames >= 3) {
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedConfig = null
+                            lockedRec = null
+                            OverlayStateStore.setSearching()
+                        }
                         delay(IDLE_POLL_MS)
                     }
                     is ParsedFrame.Animating -> {
+                        consecutiveIdleFrames = 0
                         delay(ACTIVE_POLL_MS)
                     }
                     is ParsedFrame.ActiveBoard -> {
+                        consecutiveIdleFrames = 0
                         val traySig = parsed.tray.joinToString("|") { slot ->
                             when (slot) {
                                 is com.example.engine.TraySlotState.Empty -> "E"
                                 is com.example.engine.TraySlotState.Recognized -> "${slot.slotIndex}:${slot.piece.id}"
                             }
                         }
-                        if (parsed.boardMask != lastBoardMask ||
-                            traySig != lastTraySig ||
-                            state.roiConfig != lastConfig
-                        ) {
-                            lastBoardMask = parsed.boardMask
-                            lastTraySig = traySig
-                            lastConfig = state.roiConfig
+
+                        // Active-Move Lock: once a valid move is displayed for (boardMask, traySig, config),
+                        // keep it locked without re-evaluating until the board, tray, or user settings actually change.
+                        val isUnchanged = lockedRec != null &&
+                            parsed.boardMask == lockedBoardMask &&
+                            traySig == lockedTraySig &&
+                            state.roiConfig == lockedConfig
+
+                        if (!isUnchanged) {
                             val rec = BitboardSolver.solve(
                                 boardMask = parsed.boardMask,
                                 tray = parsed.tray,
                                 mode = state.roiConfig.solverMode
                             )
+                            lockedBoardMask = parsed.boardMask
+                            lockedTraySig = traySig
+                            lockedConfig = state.roiConfig
+                            lockedRec = rec
                             OverlayStateStore.updateGuidance(
                                 boardMask = parsed.boardMask,
                                 themeRgb = parsed.emptyCellColorRgb,

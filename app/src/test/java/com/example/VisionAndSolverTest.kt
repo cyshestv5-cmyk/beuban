@@ -207,4 +207,117 @@ class VisionAndSolverTest {
             active.tray.map { (it as TraySlotState.Recognized).piece.id }
         )
     }
+
+    @Test
+    fun `red theme single 3x3 tray screenshot parses exact board and tray piece`() {
+        val (frame, w, h) = loadFrame("Screenshot_20261123_235903_com_blockblast_lite_AppActivity_f51f6358.jpg")
+        val cfg = AdaptiveRoiConfig()
+        val parser = AdaptiveScreenParser()
+        val parsed = parser.parse(frame, w, h, cfg, requireStability = false)
+        assertTrue("Expected ActiveBoard on red screenshot, got $parsed", parsed is ParsedFrame.ActiveBoard)
+        val active = parsed as ParsedFrame.ActiveBoard
+
+        val expectedBoard = listOf(
+            ".......#",
+            "......##",
+            "......##",
+            "........",
+            "#.......",
+            "#.......",
+            "........",
+            "........"
+        ).joinToString("\n")
+
+        assertEquals(expectedBoard, asciiBoard(active.boardMask))
+        assertTrue(active.tray[0] is TraySlotState.Empty)
+        assertTrue(active.tray[1] is TraySlotState.Empty)
+        assertTrue(active.tray[2] is TraySlotState.Recognized)
+        assertEquals("sq_3x3", (active.tray[2] as TraySlotState.Recognized).piece.id)
+
+        val balancedRec = BitboardSolver.solve(active.boardMask, active.tray, SolverMode.BALANCED_SURVIVAL)
+        assertNotNull(balancedRec)
+        assertEquals(2, balancedRec!!.slotIndex)
+
+        val comboRec = BitboardSolver.solve(active.boardMask, active.tray, SolverMode.COMBO_MAXIMIZER)
+        assertNotNull(comboRec)
+        assertEquals(2, comboRec!!.slotIndex)
+    }
+
+    @Test
+    fun `hollow outer-perimeter overlay does not alter parsed board, tray, or stability hash`() {
+        val img = ImageIO.read(resolveAttachment("Screenshot_20261123_235903_com_blockblast_lite_AppActivity_f51f6358.jpg"))
+        val w = img.width
+        val h = img.height
+        val rawPixels = img.getRGB(0, 0, w, h, null, 0, w)
+        val cfg = AdaptiveRoiConfig()
+
+        val parser = AdaptiveScreenParser()
+        val baseParsed = parser.parse(IntArrayPixelFrame(rawPixels, w, h), w, h, cfg, requireStability = false)
+            as ParsedFrame.ActiveBoard
+        val rec = BitboardSolver.solve(baseParsed.boardMask, baseParsed.tray, SolverMode.BALANCED_SURVIVAL)!!
+
+        // Simulate BoardHighlightOverlay rendering on captured pixels:
+        // 1) Hollow outer 11% perimeter strokes around target footprint cells
+        // 2) Indicator bar + NEXT badge strictly below trayBottom
+        val overlaidPixels = rawPixels.copyOf()
+        val mintRgb = 0xFF00E699.toInt()
+        val gridLeftPx = cfg.gridLeft * w
+        val gridTopPx = cfg.gridTop * h
+        val cellWPx = cfg.cellWidth() * w
+        val cellHPx = cfg.cellHeight() * h
+        val insetX = cellWPx * 0.11f
+        val insetY = cellHPx * 0.11f
+        val strokeHalf = 3
+        val occupied = rec.piece.cells().toSet()
+
+        fun drawThickSegment(x0: Int, y0: Int, x1: Int, y1: Int) {
+            val minX = kotlin.math.min(x0, x1) - strokeHalf
+            val maxX = kotlin.math.max(x0, x1) + strokeHalf
+            val minY = kotlin.math.min(y0, y1) - strokeHalf
+            val maxY = kotlin.math.max(y0, y1) + strokeHalf
+            for (y in minY.coerceIn(0, h - 1)..maxY.coerceIn(0, h - 1)) {
+                for (x in minX.coerceIn(0, w - 1)..maxX.coerceIn(0, w - 1)) {
+                    overlaidPixels[y * w + x] = mintRgb
+                }
+            }
+        }
+
+        for ((dr, dc) in occupied) {
+            val cl = (gridLeftPx + (rec.targetCol + dc) * cellWPx).toInt()
+            val ct = (gridTopPx + (rec.targetRow + dr) * cellHPx).toInt()
+            val cr = (cl + cellWPx).toInt()
+            val cb = (ct + cellHPx).toInt()
+            if ((dr - 1 to dc) !in occupied) drawThickSegment(cl + insetX.toInt(), ct + insetY.toInt(), cr - insetX.toInt(), ct + insetY.toInt())
+            if ((dr + 1 to dc) !in occupied) drawThickSegment(cl + insetX.toInt(), cb - insetY.toInt(), cr - insetX.toInt(), cb - insetY.toInt())
+            if ((dr to dc - 1) !in occupied) drawThickSegment(cl + insetX.toInt(), ct + insetY.toInt(), cl + insetX.toInt(), cb - insetY.toInt())
+            if ((dr to dc + 1) !in occupied) drawThickSegment(cr - insetX.toInt(), ct + insetY.toInt(), cr - insetX.toInt(), cb - insetY.toInt())
+        }
+
+        // Below-tray indicator badge strictly below trayBottom
+        val trayBottomY = (cfg.trayBottom * h).toInt() + 10
+        val slotBounds = cfg.traySlotBounds(rec.slotIndex)
+        val slotCx = ((slotBounds.left + slotBounds.right) * 0.5f * w).toInt()
+        for (y in trayBottomY.coerceIn(0, h - 1)..(trayBottomY + 28).coerceIn(0, h - 1)) {
+            for (x in (slotCx - 50).coerceIn(0, w - 1)..(slotCx + 50).coerceIn(0, w - 1)) {
+                overlaidPixels[y * w + x] = mintRgb
+            }
+        }
+
+        // Verify 2-frame stability across raw -> overlaid transition stays locked on same ActiveBoard
+        val stableParser = AdaptiveScreenParser()
+        stableParser.parse(IntArrayPixelFrame(rawPixels, w, h), w, h, cfg, requireStability = true)
+        val overlaidResult = stableParser.parse(IntArrayPixelFrame(overlaidPixels, w, h), w, h, cfg, requireStability = true)
+        assertTrue(
+            "Overlaid frame should stay stable and ActiveBoard without self-capture drift, got $overlaidResult",
+            overlaidResult is ParsedFrame.ActiveBoard
+        )
+        val activeOverlaid = overlaidResult as ParsedFrame.ActiveBoard
+        assertEquals(baseParsed.boardMask, activeOverlaid.boardMask)
+        assertEquals(baseParsed.tray, activeOverlaid.tray)
+
+        val recAfter = BitboardSolver.solve(activeOverlaid.boardMask, activeOverlaid.tray, SolverMode.BALANCED_SURVIVAL)
+        assertEquals(rec.slotIndex, recAfter?.slotIndex)
+        assertEquals(rec.targetRow, recAfter?.targetRow)
+        assertEquals(rec.targetCol, recAfter?.targetCol)
+    }
 }
