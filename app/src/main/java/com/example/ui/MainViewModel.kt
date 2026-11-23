@@ -160,7 +160,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateDragLiftOffset(cells: Float) {
         viewModelScope.launch {
-            prefs.updateConfig { it.copy(dragLiftOffsetCells = cells.coerceIn(-1.0f, 2.5f)) }
+            prefs.updateConfig { it.copy(dragLiftOffsetCells = cells.coerceIn(-1.0f, 4.8f)) }
+        }
+    }
+
+    fun updateDragVerticalGain(gain: Float) {
+        viewModelScope.launch {
+            prefs.updateConfig { it.copy(dragVerticalGain = gain.coerceIn(0.75f, 1.95f)) }
         }
     }
 

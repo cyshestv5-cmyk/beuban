@@ -238,6 +238,32 @@ fun LaunchpadScreen(
                         )
                     }
 
+                    val calBadgeText = when {
+                        !runtime.lastCalibrationSummary.isNullOrBlank() -> runtime.lastCalibrationSummary
+                        roiConfig.calibratedScreenWidthPx > 0 && roiConfig.dragCalibrationSamples > 0 -> {
+                            val g = ((roiConfig.dragVerticalGain * 100).toInt() / 100f)
+                            val l = ((roiConfig.dragLiftOffsetCells * 100).toInt() / 100f)
+                            "Saved ${roiConfig.calibratedScreenWidthPx}×${roiConfig.calibratedScreenHeightPx} • ${g}x, +${l}c (${roiConfig.dragCalibrationSamples} drops)"
+                        }
+                        roiConfig.calibratedScreenWidthPx > 0 ->
+                            "Screen adapted: ${roiConfig.calibratedScreenWidthPx}×${roiConfig.calibratedScreenHeightPx}"
+                        else -> null
+                    }
+                    if (calBadgeText != null) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            modifier = Modifier.testTag("calibration_summary_pill")
+                        ) {
+                            Text(
+                                text = calBadgeText,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MintSurge,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+
                     if (!runtime.noticeMessage.isNullOrBlank()) {
                         Surface(
                             shape = MaterialTheme.shapes.small,
@@ -576,7 +602,7 @@ fun LaunchpadScreen(
                     tint = ElectricCobalt
                 )
                 Text(
-                    text = "Verify-After-Drop checks every automated drag and automatically compensates vertical drag lift so pieces lock accurately into place.",
+                    text = "Verify-After-Drop measures your phone's exact screen dimensions and upward drag gain in real time, saving calibration to private storage across launches.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

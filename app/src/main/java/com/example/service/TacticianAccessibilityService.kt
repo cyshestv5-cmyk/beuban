@@ -20,6 +20,7 @@ import com.example.data.PreferencesRepository
 import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.AdaptiveScreenParser
+import com.example.engine.AutoLayoutCalibrator
 import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
 import com.example.engine.DropVerificationResult
@@ -33,7 +34,6 @@ import com.example.overlay.OverlayWindowHost
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.math.max
-import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,10 +51,11 @@ import kotlinx.coroutines.withContext
 
 /**
  * Android 15+ compliant AccessibilityService powering:
- * 1. Smooth multi-segment GestureDescription piece dragging for Autoplay.
+ * 1. Smooth multi-segment GestureDescription piece dragging for Autoplay with persisted gain/lift compensation.
  * 2. Zero-prompt AccessibilityService.takeScreenshot() board reading on Android 11-15+
  *    with seamless fallback signaling to MediaProjection when unsupported or restricted.
- * 3. Closed-loop Verify-After-Drop checks with automatic vertical lift calibration.
+ * 3. Live screen-size board/tray auto-detection and closed-loop Verify-After-Drop LMS calibration
+ *    persisted in app private storage.
  */
 @SuppressLint("AccessibilityPolicy")
 class TacticianAccessibilityService : AccessibilityService() {
@@ -88,18 +89,17 @@ class TacticianAccessibilityService : AccessibilityService() {
 
         /**
          * Dispatches a smooth human-paced drag from tray slot center to target cell center
-         * (compensated for Block Blast Lite's finger lift offset).
+         * using the device's calibrated gain and finger-lift compensation.
          * Callable from both Accessibility capture loop and MediaProjection fallback service.
          */
         suspend fun executeAutoplayDrag(
             config: AdaptiveRoiConfig,
             rec: MoveRecommendation,
             screenW: Int,
-            screenH: Int,
-            learnedLiftDeltaCells: Float
+            screenH: Int
         ): Boolean {
             val svc = activeInstance ?: return false
-            return svc.performPieceDrag(config, rec, screenW, screenH, learnedLiftDeltaCells)
+            return svc.performPieceDrag(config, rec, screenW, screenH)
         }
     }
 
@@ -114,6 +114,7 @@ class TacticianAccessibilityService : AccessibilityService() {
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
     private val parser = AdaptiveScreenParser()
 
+    private var prefs: PreferencesRepository? = null
     private var overlayHost: OverlayWindowHost? = null
     private var nativeLoopJob: Job? = null
 
@@ -127,9 +128,10 @@ class TacticianAccessibilityService : AccessibilityService() {
         updateDisplayMetrics()
         overlayHost = OverlayWindowHost(context = this, useAccessibilityOverlayType = true)
 
-        val prefs = PreferencesRepository(applicationContext)
+        val repo = PreferencesRepository(applicationContext)
+        prefs = repo
         serviceScope.launch {
-            prefs.configFlow.collectLatest { cfg ->
+            repo.configFlow.collectLatest { cfg ->
                 OverlayStateStore.updateRoiConfig(cfg)
             }
         }
@@ -193,6 +195,7 @@ class TacticianAccessibilityService : AccessibilityService() {
             var consecutiveIdleFrames = 0
             var consecutiveErrors = 0
             var failedDropStreak = 0
+            var hasVerifiedLayoutForSession = false
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
@@ -221,13 +224,51 @@ class TacticianAccessibilityService : AccessibilityService() {
                     }
                     is CaptureAttempt.Frame -> {
                         consecutiveErrors = 0
-                        val parsed = parser.parse(
+                        updateDisplayMetrics()
+
+                        var activeConfig = state.roiConfig
+                        var parsed = parser.parse(
                             frame = cap.pixelFrame,
                             width = cap.width,
                             height = cap.height,
-                            config = state.roiConfig,
+                            config = activeConfig,
                             requireStability = true
                         )
+
+                        val screenChanged =
+                            activeConfig.calibratedScreenWidthPx != screenWidthPx ||
+                                activeConfig.calibratedScreenHeightPx != screenHeightPx
+                        val needsAutoLayout =
+                            screenChanged || (!hasVerifiedLayoutForSession && parsed is ParsedFrame.IdleOrMenu)
+
+                        if (needsAutoLayout) {
+                            val detected = withContext(Dispatchers.Default) {
+                                AutoLayoutCalibrator.detectBoardAndTrayLayout(
+                                    frame = cap.pixelFrame,
+                                    width = cap.width,
+                                    height = cap.height,
+                                    baseConfig = activeConfig,
+                                    fullScreenWidthPx = screenWidthPx,
+                                    fullScreenHeightPx = screenHeightPx
+                                )
+                            }
+                            if (detected != null) {
+                                activeConfig = detected
+                                hasVerifiedLayoutForSession = true
+                                OverlayStateStore.updateRoiConfig(detected)
+                                persistLayoutCalibration(detected)
+                                parser.resetStability()
+                                parsed = parser.parse(
+                                    frame = cap.pixelFrame,
+                                    width = cap.width,
+                                    height = cap.height,
+                                    config = detected,
+                                    requireStability = true
+                                )
+                            }
+                        } else if (parsed is ParsedFrame.ActiveBoard) {
+                            hasVerifiedLayoutForSession = true
+                        }
 
                         when (parsed) {
                             is ParsedFrame.IdleOrMenu -> {
@@ -254,7 +295,7 @@ class TacticianAccessibilityService : AccessibilityService() {
                                 val isSameBoard = lockedRec != null &&
                                     parsed.boardMask == lockedBoardMask &&
                                     traySig == lockedTraySig &&
-                                    state.roiConfig == lockedConfig
+                                    activeConfig == lockedConfig
 
                                 val recToUse: MoveRecommendation? = if (isSameBoard) {
                                     lockedRec
@@ -264,13 +305,13 @@ class TacticianAccessibilityService : AccessibilityService() {
                                         BitboardSolver.solve(
                                             boardMask = parsed.boardMask,
                                             tray = parsed.tray,
-                                            mode = state.roiConfig.solverMode,
-                                            depth = state.roiConfig.thinkingDepth
+                                            mode = activeConfig.solverMode,
+                                            depth = activeConfig.thinkingDepth
                                         )
                                     }
                                     lockedBoardMask = parsed.boardMask
                                     lockedTraySig = traySig
-                                    lockedConfig = state.roiConfig
+                                    lockedConfig = activeConfig
                                     lockedRec = solved
                                     lockedActive = parsed
                                     OverlayStateStore.updateGuidance(
@@ -296,12 +337,12 @@ class TacticianAccessibilityService : AccessibilityService() {
                                     }
 
                                     OverlayStateStore.setDragging(recToUse)
+                                    val dragConfig = OverlayStateStore.state.value.roiConfig
                                     val dragOk = performPieceDrag(
-                                        config = currentState.roiConfig,
+                                        config = dragConfig,
                                         rec = recToUse,
                                         screenW = screenWidthPx,
-                                        screenH = screenHeightPx,
-                                        learnedLiftDeltaCells = currentState.learnedLiftDeltaCells
+                                        screenH = screenHeightPx
                                     )
 
                                     if (!dragOk) {
@@ -316,16 +357,19 @@ class TacticianAccessibilityService : AccessibilityService() {
                                         continue
                                     }
 
-                                    // Verify-After-Drop closed-loop check
+                                    // Verify-After-Drop closed-loop check + real-time calibration
                                     OverlayStateStore.setVerifying()
                                     delay(300L)
                                     parser.resetStability()
 
-                                    val postFrame = awaitSettledPostDropBoard(currentState.roiConfig)
+                                    val postFrame = awaitSettledPostDropBoard(dragConfig)
                                     val preActive = lockedActive
                                     if (postFrame != null && preActive != null) {
                                         when (
                                             val verdict = AutoplayMoveVerifier.verifyDrop(
+                                                config = dragConfig,
+                                                screenWidthPx = screenWidthPx,
+                                                screenHeightPx = screenHeightPx,
                                                 preBoardMask = preActive.boardMask,
                                                 preTray = preActive.tray,
                                                 executed = recToUse,
@@ -335,7 +379,14 @@ class TacticianAccessibilityService : AccessibilityService() {
                                         ) {
                                             is DropVerificationResult.Verified -> {
                                                 failedDropStreak = 0
-                                                OverlayStateStore.recordVerifiedMove(verdict.liftOffsetCorrectionCells)
+                                                val calUpdate = verdict.calibrationUpdate
+                                                if (calUpdate != null) {
+                                                    OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
+                                                    persistMovementCalibration(calUpdate.updatedConfig)
+                                                    OverlayStateStore.recordVerifiedMove(calUpdate.summary)
+                                                } else {
+                                                    OverlayStateStore.recordVerifiedMove(null)
+                                                }
                                                 lockedBoardMask = -1L
                                                 lockedTraySig = ""
                                                 lockedRec = null
@@ -351,14 +402,21 @@ class TacticianAccessibilityService : AccessibilityService() {
                                             }
                                             is DropVerificationResult.NotApplied -> {
                                                 failedDropStreak++
+                                                val recovered = AutoplayMoveVerifier.recoverFromFailedDrop(
+                                                    dragConfig,
+                                                    recToUse
+                                                )
+                                                OverlayStateStore.updateRoiConfig(recovered)
+                                                persistMovementCalibration(recovered)
                                                 lockedBoardMask = -1L
                                                 lockedTraySig = ""
                                                 lockedRec = null
                                                 lockedActive = null
-                                                if (failedDropStreak >= 3) {
+                                                val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
+                                                if (failedDropStreak >= maxFailures) {
                                                     OverlayStateStore.setPaused(
                                                         true,
-                                                        "Autoplay paused — drop did not register. Adjust Drag Lift in Calibrate."
+                                                        "Autoplay paused — drop did not register. Adjust Drag Lift or Gain in Calibrate."
                                                     )
                                                 }
                                             }
@@ -378,6 +436,39 @@ class TacticianAccessibilityService : AccessibilityService() {
                     }
                 }
             }
+        }
+    }
+
+    private suspend fun persistLayoutCalibration(detected: AdaptiveRoiConfig) {
+        val repo = prefs ?: return
+        repo.updateConfig { current ->
+            current.copy(
+                gridLeft = detected.gridLeft,
+                gridTop = detected.gridTop,
+                gridRight = detected.gridRight,
+                gridBottom = detected.gridBottom,
+                trayTop = detected.trayTop,
+                trayBottom = detected.trayBottom,
+                trayLeftMargin = detected.trayLeftMargin,
+                trayRightMargin = detected.trayRightMargin,
+                expectedMiniTileWidthFraction = detected.expectedMiniTileWidthFraction,
+                calibratedScreenWidthPx = detected.calibratedScreenWidthPx,
+                calibratedScreenHeightPx = detected.calibratedScreenHeightPx
+            )
+        }
+    }
+
+    private suspend fun persistMovementCalibration(calibrated: AdaptiveRoiConfig) {
+        val repo = prefs ?: return
+        repo.updateConfig { current ->
+            current.copy(
+                dragLiftOffsetCells = calibrated.dragLiftOffsetCells,
+                dragVerticalGain = calibrated.dragVerticalGain,
+                dragHorizontalGain = calibrated.dragHorizontalGain,
+                calibratedScreenWidthPx = calibrated.calibratedScreenWidthPx,
+                calibratedScreenHeightPx = calibrated.calibratedScreenHeightPx,
+                dragCalibrationSamples = calibrated.dragCalibrationSamples
+            )
         }
     }
 
@@ -494,26 +585,29 @@ class TacticianAccessibilityService : AccessibilityService() {
         config: AdaptiveRoiConfig,
         rec: MoveRecommendation,
         screenW: Int,
-        screenH: Int,
-        learnedLiftDeltaCells: Float
+        screenH: Int
     ): Boolean {
-        val slotBounds = config.traySlotBounds(rec.slotIndex)
-        val startX = ((slotBounds.left + slotBounds.right) * 0.5f) * screenW
-        val startY = ((slotBounds.top + slotBounds.bottom) * 0.5f) * screenH
+        updateDisplayMetrics()
+        val effectiveW = if (screenWidthPx > 0) screenWidthPx else screenW
+        val effectiveH = if (screenHeightPx > 0) screenHeightPx else screenH
 
-        val cellHPx = config.cellHeight() * screenH
-        val targetCenterCol = rec.targetCol + rec.piece.width * 0.5f
-        val targetCenterRow = rec.targetRow + rec.piece.height * 0.5f
-        val endX = ((config.gridLeft + targetCenterCol * config.cellWidth()) * screenW)
-            .coerceIn(16f, screenW - 16f)
-        val liftCells = (config.dragLiftOffsetCells + learnedLiftDeltaCells).coerceIn(-1.5f, 3.0f)
-        val endY = ((config.gridTop + targetCenterRow * config.cellHeight()) * screenH + liftCells * cellHPx)
-            .coerceIn(cellHPx * 0.5f, screenH - 48f)
+        val endpoints = config.computeDragEndpoints(
+            slotIndex = rec.slotIndex,
+            targetRow = rec.targetRow,
+            targetCol = rec.targetCol,
+            pieceWidth = rec.piece.width,
+            pieceHeight = rec.piece.height,
+            screenWidthPx = effectiveW,
+            screenHeightPx = effectiveH
+        )
+
+        val touchX = endpoints.startX
+        val touchY = endpoints.startY
+        val endX = endpoints.endX
+        val endY = endpoints.endY
 
         // Segment 1: Touch down and hold 45ms so the tray picks up the piece cleanly
-        val touchX = startX
-        val touchY = startY
-        val pressEndY = startY + 1f
+        val pressEndY = touchY + 1f
         val pressPath = Path().apply {
             moveTo(touchX, touchY)
             lineTo(touchX, pressEndY)
@@ -522,7 +616,7 @@ class TacticianAccessibilityService : AccessibilityService() {
         if (!dispatchStroke(pressStroke)) return false
 
         // Segment 2: Smooth ease-in-out glide over 330ms to destination
-        val glideEndY = endY - 1f
+        val glideEndY = (endY - 1f).coerceAtLeast(8f)
         val glidePath = Path().apply {
             moveTo(touchX, pressEndY)
             val steps = 16
@@ -536,7 +630,6 @@ class TacticianAccessibilityService : AccessibilityService() {
         }
         val glideStroke = pressStroke.continueStroke(glidePath, 0L, 330L, true)
         if (!dispatchStroke(glideStroke)) {
-            // Release safely if interrupted mid-flight
             val releasePath = Path().apply {
                 moveTo(endX, glideEndY)
                 lineTo(endX, glideEndY)

@@ -60,6 +60,7 @@ fun CalibrateScreen(
     onUpdateTrayBounds: (trayTop: Float, trayHeight: Float) -> Unit,
     onUpdateOpacity: (Float) -> Unit,
     onUpdateDragLift: (Float) -> Unit,
+    onUpdateDragVerticalGain: (Float) -> Unit,
     onResetDefaults: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -84,6 +85,44 @@ fun CalibrateScreen(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+
+        // Saved Phone Calibration Status Card
+        val formattedLiftHeader = ((config.dragLiftOffsetCells * 100f).roundToInt() / 100f)
+        val formattedGainHeader = ((config.dragVerticalGain * 100f).roundToInt() / 100f)
+        val screenBadge = if (config.calibratedScreenWidthPx > 0 && config.calibratedScreenHeightPx > 0) {
+            "${config.calibratedScreenWidthPx}×${config.calibratedScreenHeightPx} px"
+        } else {
+            "Auto-detects on first frame"
+        }
+        Surface(
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            border = BorderStroke(1.dp, MintSurge.copy(alpha = 0.35f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("saved_calibration_card")
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "Saved Phone Calibration",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MintSurge
+                )
+                Text(
+                    text = "Screen: $screenBadge • ${config.dragCalibrationSamples} drops calibrated",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "Vertical Gain: ${formattedGainHeader}x • Lift Offset: +$formattedLiftHeader cells",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         // Theme Preview Toggle (Wood vs Red vs Light)
@@ -194,11 +233,23 @@ fun CalibrateScreen(
                         }
                     }
 
-                    // Sample target cell vs Autoplay finger touch point (compensated by dragLiftOffsetCells)
-                    val sampleTarget = Offset(gLeft + 3.5f * cw, gTop + 3.5f * ch)
+                    // Sample target cell vs Autoplay finger touch point (using persisted gain & lift)
+                    val previewEndpoints = config.computeDragEndpoints(
+                        slotIndex = 1,
+                        targetRow = 2,
+                        targetCol = 3,
+                        pieceWidth = 1,
+                        pieceHeight = 1,
+                        screenWidthPx = w.roundToInt().coerceAtLeast(100),
+                        screenHeightPx = h.roundToInt().coerceAtLeast(200)
+                    )
+                    val sampleTarget = Offset(
+                        gLeft + 3.5f * cw,
+                        previewEndpoints.baseTargetY
+                    )
                     val touchDrop = Offset(
-                        sampleTarget.x,
-                        (sampleTarget.y + config.dragLiftOffsetCells * ch).coerceIn(gTop, h - 16f)
+                        previewEndpoints.endX,
+                        previewEndpoints.endY.coerceIn(gTop * 0.6f, h - 16f)
                     )
                     drawLine(
                         color = AmberPop,
@@ -240,12 +291,20 @@ fun CalibrateScreen(
                 modifier = Modifier.padding(18.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                val formattedGain = ((config.dragVerticalGain * 100f).roundToInt() / 100f)
+                SliderSetting(
+                    label = "Vertical Drag Gain",
+                    valueText = "${formattedGain}x",
+                    value = config.dragVerticalGain.coerceIn(0.75f, 1.95f),
+                    range = 0.75f..1.95f,
+                    onValueChange = onUpdateDragVerticalGain
+                )
                 val formattedLift = ((config.dragLiftOffsetCells * 10f).roundToInt() / 10f)
                 SliderSetting(
                     label = "Autoplay Drag Lift Offset",
                     valueText = "${if (formattedLift >= 0f) "+" else ""}$formattedLift cells",
-                    value = config.dragLiftOffsetCells,
-                    range = -1.0f..2.5f,
+                    value = config.dragLiftOffsetCells.coerceIn(-1.0f, 4.8f),
+                    range = -1.0f..4.8f,
                     onValueChange = onUpdateDragLift
                 )
                 SliderSetting(

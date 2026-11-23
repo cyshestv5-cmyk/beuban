@@ -31,6 +31,7 @@ import com.example.data.PreferencesRepository
 import com.example.data.ServiceStatus
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.AdaptiveScreenParser
+import com.example.engine.AutoLayoutCalibrator
 import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
 import com.example.engine.ByteBufferPixelFrame
@@ -77,6 +78,7 @@ class ScreenCaptureService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val parser = AdaptiveScreenParser()
 
+    private var prefs: PreferencesRepository? = null
     private var windowManager: WindowManager? = null
     private var overlayHost: OverlayWindowHost? = null
     private var mediaProjection: MediaProjection? = null
@@ -121,9 +123,10 @@ class ScreenCaptureService : Service() {
         updateDisplayMetrics()
         createNotificationChannel()
 
-        val prefs = PreferencesRepository(applicationContext)
+        val repo = PreferencesRepository(applicationContext)
+        prefs = repo
         serviceScope.launch {
-            prefs.configFlow.collectLatest { cfg ->
+            repo.configFlow.collectLatest { cfg ->
                 OverlayStateStore.updateRoiConfig(cfg)
             }
         }
@@ -250,6 +253,7 @@ class ScreenCaptureService : Service() {
             var lockedActive: ParsedFrame.ActiveBoard? = null
             var consecutiveIdleFrames = 0
             var failedDropStreak = 0
+            var hasVerifiedLayoutForSession = false
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
@@ -258,10 +262,31 @@ class ScreenCaptureService : Service() {
                     continue
                 }
 
-                val parsed = acquireParsedFrame(state.roiConfig, requireStability = true)
-                if (parsed == null) {
+                updateDisplayMetrics()
+                var activeConfig = state.roiConfig
+                val screenChanged =
+                    activeConfig.calibratedScreenWidthPx != screenWidthPx ||
+                        activeConfig.calibratedScreenHeightPx != screenHeightPx
+
+                val acquired = acquireParsedFrameWithAutoLayout(
+                    config = activeConfig,
+                    requireStability = true,
+                    allowAutoLayout = screenChanged || !hasVerifiedLayoutForSession
+                )
+                if (acquired == null) {
                     delay(ACTIVE_POLL_MS)
                     continue
+                }
+
+                val parsed = acquired.first
+                val autoLayout = acquired.second
+                if (autoLayout != null) {
+                    activeConfig = autoLayout
+                    hasVerifiedLayoutForSession = true
+                    OverlayStateStore.updateRoiConfig(autoLayout)
+                    persistLayoutCalibration(autoLayout)
+                } else if (parsed is ParsedFrame.ActiveBoard) {
+                    hasVerifiedLayoutForSession = true
                 }
 
                 when (parsed) {
@@ -289,7 +314,7 @@ class ScreenCaptureService : Service() {
                         val isUnchanged = lockedRec != null &&
                             parsed.boardMask == lockedBoardMask &&
                             traySig == lockedTraySig &&
-                            state.roiConfig == lockedConfig
+                            activeConfig == lockedConfig
 
                         val recToUse: MoveRecommendation? = if (isUnchanged) {
                             lockedRec
@@ -299,13 +324,13 @@ class ScreenCaptureService : Service() {
                                 BitboardSolver.solve(
                                     boardMask = parsed.boardMask,
                                     tray = parsed.tray,
-                                    mode = state.roiConfig.solverMode,
-                                    depth = state.roiConfig.thinkingDepth
+                                    mode = activeConfig.solverMode,
+                                    depth = activeConfig.thinkingDepth
                                 )
                             }
                             lockedBoardMask = parsed.boardMask
                             lockedTraySig = traySig
-                            lockedConfig = state.roiConfig
+                            lockedConfig = activeConfig
                             lockedRec = rec
                             lockedActive = parsed
                             OverlayStateStore.updateGuidance(
@@ -328,12 +353,12 @@ class ScreenCaptureService : Service() {
                                 continue
                             }
                             OverlayStateStore.setDragging(recToUse)
+                            val dragConfig = OverlayStateStore.state.value.roiConfig
                             val dragOk = TacticianAccessibilityService.executeAutoplayDrag(
-                                config = currentState.roiConfig,
+                                config = dragConfig,
                                 rec = recToUse,
                                 screenW = screenWidthPx,
-                                screenH = screenHeightPx,
-                                learnedLiftDeltaCells = currentState.learnedLiftDeltaCells
+                                screenH = screenHeightPx
                             )
                             if (!dragOk) {
                                 failedDropStreak++
@@ -351,11 +376,14 @@ class ScreenCaptureService : Service() {
                             delay(280L)
                             parser.resetStability()
 
-                            val postBoard = awaitSettledPostDropBoard(currentState.roiConfig)
+                            val postBoard = awaitSettledPostDropBoard(dragConfig)
                             val preActive = lockedActive
                             if (postBoard != null && preActive != null) {
                                 when (
                                     val verdict = AutoplayMoveVerifier.verifyDrop(
+                                        config = dragConfig,
+                                        screenWidthPx = screenWidthPx,
+                                        screenHeightPx = screenHeightPx,
                                         preBoardMask = preActive.boardMask,
                                         preTray = preActive.tray,
                                         executed = recToUse,
@@ -365,7 +393,14 @@ class ScreenCaptureService : Service() {
                                 ) {
                                     is DropVerificationResult.Verified -> {
                                         failedDropStreak = 0
-                                        OverlayStateStore.recordVerifiedMove(verdict.liftOffsetCorrectionCells)
+                                        val calUpdate = verdict.calibrationUpdate
+                                        if (calUpdate != null) {
+                                            OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
+                                            persistMovementCalibration(calUpdate.updatedConfig)
+                                            OverlayStateStore.recordVerifiedMove(calUpdate.summary)
+                                        } else {
+                                            OverlayStateStore.recordVerifiedMove(null)
+                                        }
                                     }
                                     is DropVerificationResult.NewTurnSpawned -> {
                                         failedDropStreak = 0
@@ -373,10 +408,17 @@ class ScreenCaptureService : Service() {
                                     }
                                     is DropVerificationResult.NotApplied -> {
                                         failedDropStreak++
-                                        if (failedDropStreak >= 3) {
+                                        val recovered = AutoplayMoveVerifier.recoverFromFailedDrop(
+                                            dragConfig,
+                                            recToUse
+                                        )
+                                        OverlayStateStore.updateRoiConfig(recovered)
+                                        persistMovementCalibration(recovered)
+                                        val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
+                                        if (failedDropStreak >= maxFailures) {
                                             OverlayStateStore.setPaused(
                                                 true,
-                                                "Autoplay paused — drop did not register. Adjust Drag Lift in Calibrate."
+                                                "Autoplay paused — drop did not register. Adjust Drag Lift or Gain in Calibrate."
                                             )
                                         }
                                     }
@@ -395,16 +437,57 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    private suspend fun persistLayoutCalibration(detected: AdaptiveRoiConfig) {
+        val repo = prefs ?: return
+        repo.updateConfig { current ->
+            current.copy(
+                gridLeft = detected.gridLeft,
+                gridTop = detected.gridTop,
+                gridRight = detected.gridRight,
+                gridBottom = detected.gridBottom,
+                trayTop = detected.trayTop,
+                trayBottom = detected.trayBottom,
+                trayLeftMargin = detected.trayLeftMargin,
+                trayRightMargin = detected.trayRightMargin,
+                expectedMiniTileWidthFraction = detected.expectedMiniTileWidthFraction,
+                calibratedScreenWidthPx = detected.calibratedScreenWidthPx,
+                calibratedScreenHeightPx = detected.calibratedScreenHeightPx
+            )
+        }
+    }
+
+    private suspend fun persistMovementCalibration(calibrated: AdaptiveRoiConfig) {
+        val repo = prefs ?: return
+        repo.updateConfig { current ->
+            current.copy(
+                dragLiftOffsetCells = calibrated.dragLiftOffsetCells,
+                dragVerticalGain = calibrated.dragVerticalGain,
+                dragHorizontalGain = calibrated.dragHorizontalGain,
+                calibratedScreenWidthPx = calibrated.calibratedScreenWidthPx,
+                calibratedScreenHeightPx = calibrated.calibratedScreenHeightPx,
+                dragCalibrationSamples = calibrated.dragCalibrationSamples
+            )
+        }
+    }
+
     private suspend fun awaitSettledPostDropBoard(config: AdaptiveRoiConfig): ParsedFrame.ActiveBoard? {
         for (attempt in 0 until 5) {
-            val frame = acquireParsedFrame(config, requireStability = false)
+            val frame = acquireParsedFrameWithAutoLayout(
+                config = config,
+                requireStability = false,
+                allowAutoLayout = false
+            )?.first
             if (frame is ParsedFrame.ActiveBoard) return frame
             delay(180L)
         }
         return null
     }
 
-    private fun acquireParsedFrame(config: AdaptiveRoiConfig, requireStability: Boolean): ParsedFrame? {
+    private fun acquireParsedFrameWithAutoLayout(
+        config: AdaptiveRoiConfig,
+        requireStability: Boolean,
+        allowAutoLayout: Boolean
+    ): Pair<ParsedFrame, AdaptiveRoiConfig?>? {
         val reader = imageReader ?: return null
         val image = try {
             reader.acquireLatestImage()
@@ -421,13 +504,39 @@ class ScreenCaptureService : Service() {
                 pixelStride = plane.pixelStride,
                 rowStride = plane.rowStride
             )
-            parser.parse(
+            var parsed = parser.parse(
                 frame = frame,
                 width = image.width,
                 height = image.height,
                 config = config,
                 requireStability = requireStability
             )
+            var updatedCfg: AdaptiveRoiConfig? = null
+            val screenChanged =
+                config.calibratedScreenWidthPx != screenWidthPx ||
+                    config.calibratedScreenHeightPx != screenHeightPx
+            if (allowAutoLayout && (screenChanged || parsed is ParsedFrame.IdleOrMenu)) {
+                val detected = AutoLayoutCalibrator.detectBoardAndTrayLayout(
+                    frame = frame,
+                    width = image.width,
+                    height = image.height,
+                    baseConfig = config,
+                    fullScreenWidthPx = screenWidthPx,
+                    fullScreenHeightPx = screenHeightPx
+                )
+                if (detected != null) {
+                    updatedCfg = detected
+                    parser.resetStability()
+                    parsed = parser.parse(
+                        frame = frame,
+                        width = image.width,
+                        height = image.height,
+                        config = detected,
+                        requireStability = requireStability
+                    )
+                }
+            }
+            parsed to updatedCfg
         } finally {
             image.close()
         }

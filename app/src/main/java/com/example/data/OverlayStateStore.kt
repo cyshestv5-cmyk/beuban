@@ -33,7 +33,7 @@ data class OverlayRuntimeState(
     val captureWidthPx: Int = 0,
     val captureHeightPx: Int = 0,
     val autoplayMovesCount: Int = 0,
-    val learnedLiftDeltaCells: Float = 0f,
+    val lastCalibrationSummary: String? = null,
     val noticeMessage: String? = null
 )
 
@@ -62,7 +62,6 @@ object OverlayStateStore {
                 captureWidthPx = widthPx,
                 captureHeightPx = heightPx,
                 autoplayMovesCount = 0,
-                learnedLiftDeltaCells = 0f,
                 noticeMessage = null
             )
         }
@@ -134,16 +133,11 @@ object OverlayStateStore {
         }
     }
 
-    fun recordVerifiedMove(learnedDeltaAdjustment: Float? = null) {
+    fun recordVerifiedMove(calibrationSummary: String? = null) {
         _state.update { current ->
-            val updatedDelta = if (learnedDeltaAdjustment != null) {
-                (current.learnedLiftDeltaCells + learnedDeltaAdjustment).coerceIn(-1.5f, 1.5f)
-            } else {
-                current.learnedLiftDeltaCells
-            }
             current.copy(
                 autoplayMovesCount = current.autoplayMovesCount + 1,
-                learnedLiftDeltaCells = updatedDelta
+                lastCalibrationSummary = calibrationSummary ?: current.lastCalibrationSummary
             )
         }
     }
@@ -175,7 +169,6 @@ object OverlayStateStore {
                 captureSource = CaptureSource.NONE,
                 recommendation = null,
                 detectedThemeRgb = null,
-                learnedLiftDeltaCells = 0f,
                 noticeMessage = null
             )
         }

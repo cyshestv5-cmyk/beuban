@@ -299,6 +299,7 @@ fun TacticianAppRoot(vm: MainViewModel = viewModel()) {
                         onUpdateTrayBounds = vm::updateTrayBounds,
                         onUpdateOpacity = vm::updateOverlayOpacity,
                         onUpdateDragLift = vm::updateDragLiftOffset,
+                        onUpdateDragVerticalGain = vm::updateDragVerticalGain,
                         onResetDefaults = vm::resetRoiDefaults
                     )
                 }

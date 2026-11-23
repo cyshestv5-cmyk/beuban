@@ -2,6 +2,7 @@ package com.example
 
 import com.example.engine.AdaptiveRoiConfig
 import com.example.engine.AdaptiveScreenParser
+import com.example.engine.AutoLayoutCalibrator
 import com.example.engine.AutoplayMoveVerifier
 import com.example.engine.BitboardSolver
 import com.example.engine.DropVerificationResult
@@ -364,6 +365,7 @@ class VisionAndSolverTest {
 
     @Test
     fun `autoplay move verifier detects exact hit, drifted lift row, new turn spawn, and failed drop`() {
+        val cfg = AdaptiveRoiConfig()
         val sq2x2 = PieceCatalog.BY_ID.getValue("sq_2x2")
         val bar1x3 = PieceCatalog.BY_ID.getValue("bar_1x3")
         val preBoard = 0L
@@ -385,24 +387,32 @@ class VisionAndSolverTest {
             solveTimeMs = 12L
         )
 
-        // 1) Exact drop -> Verified(null)
+        // 1) Exact drop -> Verified with rowError == 0 and increments sample count
         val exactBoard = sq2x2.maskAt(4, 3)
         val clearedSlotTray = listOf(TraySlotState.Empty, TraySlotState.Recognized(1, bar1x3), TraySlotState.Empty)
-        val exactVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, exactBoard, clearedSlotTray)
+        val exactVerdict = AutoplayMoveVerifier.verifyDrop(cfg, 1080, 2400, preBoard, preTray, rec, exactBoard, clearedSlotTray)
         assertTrue(exactVerdict is DropVerificationResult.Verified)
-        assertNull((exactVerdict as DropVerificationResult.Verified).liftOffsetCorrectionCells)
+        val exactUpdate = (exactVerdict as DropVerificationResult.Verified).calibrationUpdate!!
+        assertEquals(0, exactUpdate.rowError)
+        assertEquals(1, exactUpdate.updatedConfig.dragCalibrationSamples)
+        assertEquals(1080, exactUpdate.updatedConfig.calibratedScreenWidthPx)
 
-        // 2) Landed 1 row higher (row 3 instead of 4) -> suggests positive lift offset adjustment
-        val driftedHighBoard = sq2x2.maskAt(3, 3)
-        val driftedVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, driftedHighBoard, clearedSlotTray)
-        assertTrue(driftedVerdict is DropVerificationResult.Verified)
-        val corr = (driftedVerdict as DropVerificationResult.Verified).liftOffsetCorrectionCells
-        assertNotNull(corr)
-        assertTrue("Expected positive downward touch compensation, got $corr", corr!! > 0.5f)
+        // 2) Landed 3 rows higher (row 1 instead of 4) -> increases lift offset & vertical gain
+        val overshotBoard = sq2x2.maskAt(1, 3)
+        val overshotVerdict = AutoplayMoveVerifier.verifyDrop(cfg, 1080, 2400, preBoard, preTray, rec, overshotBoard, clearedSlotTray)
+        assertTrue(overshotVerdict is DropVerificationResult.Verified)
+        val cal = (overshotVerdict as DropVerificationResult.Verified).calibrationUpdate!!
+        assertEquals(-3, cal.rowError)
+        assertTrue("Expected higher lift offset after overshoot, got ${cal.updatedConfig.dragLiftOffsetCells}",
+            cal.updatedConfig.dragLiftOffsetCells > cfg.dragLiftOffsetCells)
+        assertTrue("Expected higher vertical gain after overshoot, got ${cal.updatedConfig.dragVerticalGain}",
+            cal.updatedConfig.dragVerticalGain > cfg.dragVerticalGain)
 
-        // 3) Piece still in tray slot -> NotApplied
-        val missVerdict = AutoplayMoveVerifier.verifyDrop(preBoard, preTray, rec, preBoard, preTray)
+        // 3) Piece still in tray slot -> NotApplied + recoverFromFailedDrop backs off upward drag
+        val missVerdict = AutoplayMoveVerifier.verifyDrop(cfg, 1080, 2400, preBoard, preTray, rec, preBoard, preTray)
         assertTrue(missVerdict is DropVerificationResult.NotApplied)
+        val recovered = AutoplayMoveVerifier.recoverFromFailedDrop(cfg, rec.copy(targetRow = 1))
+        assertTrue(recovered.dragVerticalGain > cfg.dragVerticalGain)
 
         // 4) Last piece spawns fresh 3-piece turn -> NewTurnSpawned
         val lastPieceTray = listOf(TraySlotState.Empty, TraySlotState.Empty, TraySlotState.Recognized(2, sq2x2))
@@ -412,6 +422,9 @@ class VisionAndSolverTest {
             TraySlotState.Recognized(2, sq2x2)
         )
         val spawnVerdict = AutoplayMoveVerifier.verifyDrop(
+            cfg,
+            1080,
+            2400,
             preBoard,
             lastPieceTray,
             rec.copy(slotIndex = 2),
@@ -419,5 +432,186 @@ class VisionAndSolverTest {
             newTurnTray
         )
         assertTrue(spawnVerdict is DropVerificationResult.NewTurnSpawned)
+    }
+
+    @Test
+    fun `real-time movement calibration converges from 3-block upward overshoot within 3 drops`() {
+        val screenW = 1080
+        val screenH = 2400
+        val actualGameLiftCells = 3.0f
+        val actualGameVerticalGain = 1.25f
+
+        var currentCfg = AdaptiveRoiConfig() // Starts with default 1.8c lift, 1.15x gain
+        val dot = PieceCatalog.BY_ID.getValue("dot_1x1")
+        val bar = PieceCatalog.BY_ID.getValue("bar_1x2")
+        val targetRows = listOf(4, 5, 2, 3)
+
+        var lastAbsError = 99
+        for ((step, targetRow) in targetRows.withIndex()) {
+            val targetCol = 3
+            val endpoints = currentCfg.computeDragEndpoints(
+                slotIndex = 1,
+                targetRow = targetRow,
+                targetCol = targetCol,
+                pieceWidth = dot.width,
+                pieceHeight = dot.height,
+                screenWidthPx = screenW,
+                screenHeightPx = screenH
+            )
+            // Simulate Block Blast Lite upward sensitivity & finger lift physics
+            val cellHPx = currentCfg.cellHeight() * screenH
+            val fingerDeltaY = endpoints.endY - endpoints.startY
+            val gamePieceCenterY = endpoints.startY - actualGameLiftCells * cellHPx +
+                actualGameVerticalGain * fingerDeltaY
+            val landedRow = ((gamePieceCenterY - currentCfg.gridTop * screenH) / cellHPx - 0.5f)
+                .let { kotlin.math.round(it).toInt() }
+                .coerceIn(0, 7)
+
+            val rec = MoveRecommendation(
+                slotIndex = 1,
+                piece = dot,
+                targetRow = targetRow,
+                targetCol = targetCol,
+                linesCleared = 0,
+                fullPlan = emptyList(),
+                survivabilityScore = 10f,
+                bulkyCapacityScore = 10,
+                monteCarloSurvivalRate = 1f,
+                solveTimeMs = 5L
+            )
+            val preTray = listOf(
+                TraySlotState.Recognized(0, bar),
+                TraySlotState.Recognized(1, dot),
+                TraySlotState.Empty
+            )
+            val postTray = listOf(
+                TraySlotState.Recognized(0, bar),
+                TraySlotState.Empty,
+                TraySlotState.Empty
+            )
+            val landedBoard = dot.maskAt(landedRow, targetCol)
+            val verdict = AutoplayMoveVerifier.verifyDrop(
+                config = currentCfg,
+                screenWidthPx = screenW,
+                screenHeightPx = screenH,
+                preBoardMask = 0L,
+                preTray = preTray,
+                executed = rec,
+                postBoardMask = landedBoard,
+                postTray = postTray
+            ) as DropVerificationResult.Verified
+
+            val update = verdict.calibrationUpdate!!
+            lastAbsError = kotlin.math.abs(update.rowError)
+            println("CONVERGENCE STEP $step (target=$targetRow, landed=$landedRow): ${update.summary}")
+            currentCfg = update.updatedConfig
+        }
+
+        assertEquals("Expected convergence to 0 row error after calibration steps", 0, lastAbsError)
+        assertEquals(screenW, currentCfg.calibratedScreenWidthPx)
+        assertEquals(screenH, currentCfg.calibratedScreenHeightPx)
+        assertEquals(4, currentCfg.dragCalibrationSamples)
+    }
+
+    @Test
+    fun `auto layout calibrator adapts across themes, rejects menu, and detects shifted 16-9 screen`() {
+        // 1) Rejects StartingScreen
+        val (menuFrame, mw, mh) = loadFrame("StartingScreen_09b71782.jpg")
+        assertNull(
+            "StartingScreen should be rejected by AutoLayoutCalibrator",
+            AutoLayoutCalibrator.detectBoardAndTrayLayout(menuFrame, mw, mh, AdaptiveRoiConfig())
+        )
+
+        // 2) Accurately detects board & tray on Red and Wood gameplay screenshots
+        for (file in listOf(
+            "Screenshot_20261123_235903_com_blockblast_lite_AppActivity_f51f6358.jpg",
+            "InGame_View_20261123_173946_com_blockblast_lite_AppActivity_ceab1461.jpg",
+            "InGame_View_20261123_173822_com_blockblast_lite_AppActivity_d1660d76.jpg"
+        )) {
+            val (frame, w, h) = loadFrame(file)
+            val detected = AutoLayoutCalibrator.detectBoardAndTrayLayout(
+                frame = frame,
+                width = w,
+                height = h,
+                baseConfig = AdaptiveRoiConfig(),
+                fullScreenWidthPx = w,
+                fullScreenHeightPx = h
+            )
+            assertNotNull("AutoLayoutCalibrator failed on $file", detected)
+            assertTrue("gridTop out of expected range: ${detected!!.gridTop}", detected.gridTop in 0.21f..0.27f)
+            assertTrue("gridLeft out of expected range: ${detected.gridLeft}", detected.gridLeft in 0.03f..0.09f)
+            assertEquals(w, detected.calibratedScreenWidthPx)
+            assertEquals(h, detected.calibratedScreenHeightPx)
+
+            val parsed = AdaptiveScreenParser().parse(frame, w, h, detected, requireStability = false)
+            assertTrue("Adapted config should parse ActiveBoard on $file, got $parsed", parsed is ParsedFrame.ActiveBoard)
+        }
+
+        // 3) Adapts cleanly to a synthetic 16:9 screen (540x960) where default 20:9 ROI would miss the grid!
+        val w169 = 540
+        val h169 = 960
+        val pixels = IntArray(w169 * h169) { 0xFF335599.toInt() }
+        val trueLeft = 0.08f
+        val trueTop = 0.17f
+        val trueGridW = 1f - 2f * trueLeft // 0.84
+        val trueGridH = trueGridW * (w169.toFloat() / h169.toFloat()) // 0.4725
+        val cellW = trueGridW / 8f
+        val cellH = trueGridH / 8f
+
+        val gL = (trueLeft * w169).toInt()
+        val gR = ((1f - trueLeft) * w169).toInt()
+        val gT = (trueTop * h169).toInt()
+        val gB = ((trueTop + trueGridH) * h169).toInt()
+        for (y in gT until gB) {
+            for (x in gL until gR) {
+                pixels[y * w169 + x] = 0xFF1F273D.toInt()
+            }
+        }
+        // Draw strong grid divider lines
+        for (i in 1..7) {
+            val dx = ((trueLeft + i * cellW) * w169).toInt()
+            for (y in gT until gB) {
+                pixels[y * w169 + dx] = 0xFF0E1320.toInt()
+                pixels[y * w169 + (dx + 1).coerceAtMost(w169 - 1)] = 0xFF0E1320.toInt()
+            }
+            val dy = ((trueTop + i * cellH) * h169).toInt()
+            for (x in gL until gR) {
+                pixels[dy * w169 + x] = 0xFF0E1320.toInt()
+                pixels[(dy + 1).coerceAtMost(h169 - 1) * w169 + x] = 0xFF0E1320.toInt()
+            }
+        }
+        // Place a bright block at board cell (0,0) so board isn't blank
+        for (y in (gT + 4) until (gT + (cellH * h169).toInt() - 4)) {
+            for (x in (gL + 4) until (gL + (cellW * w169).toInt() - 4)) {
+                pixels[y * w169 + x] = 0xFFFFB020.toInt()
+            }
+        }
+        // Draw a tray piece in center slot (~0.70..0.80)
+        for (y in (0.72f * h169).toInt() until (0.78f * h169).toInt()) {
+            for (x in (0.45f * w169).toInt() until (0.55f * w169).toInt()) {
+                pixels[y * w169 + x] = 0xFF44D688.toInt()
+            }
+        }
+
+        val frame169 = IntArrayPixelFrame(pixels, w169, h169)
+        val adapted169 = AutoLayoutCalibrator.detectBoardAndTrayLayout(
+            frame = frame169,
+            width = w169,
+            height = h169,
+            baseConfig = AdaptiveRoiConfig(),
+            fullScreenWidthPx = 1080,
+            fullScreenHeightPx = 1920
+        )
+        assertNotNull("Expected 16:9 screen to be detected", adapted169)
+        assertTrue(
+            "Detected gridTop (${adapted169!!.gridTop}) should be within 0.015 of $trueTop",
+            kotlin.math.abs(adapted169.gridTop - trueTop) < 0.015f
+        )
+        assertTrue(
+            "Detected gridLeft (${adapted169.gridLeft}) should be within 0.015 of $trueLeft",
+            kotlin.math.abs(adapted169.gridLeft - trueLeft) < 0.015f
+        )
+        assertEquals(1080, adapted169.calibratedScreenWidthPx)
+        assertEquals(1920, adapted169.calibratedScreenHeightPx)
     }
 }
