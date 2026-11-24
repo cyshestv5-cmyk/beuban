@@ -33,11 +33,11 @@
     <string name="accessibility_sideload_tip">On Android 13–15, if Accessibility toggle is greyed out after installing via APK, open App Info → ⋮ menu → Allow restricted settings.</string>
     <string name="profile_section_title">Built-In Global Profile</string>
     <string name="profile_combos_title">Max Combos/Score</string>
-    <string name="profile_combos_desc">Guards live combo streaks, prioritizes multi-line chains &amp; crisp 235 ms drags</string>
+    <string name="profile_combos_desc">Full 6-order lookahead matching Guide mode, guards combo streaks with calm settles</string>
     <string name="profile_survival_title">Max Survival</string>
-    <string name="profile_survival_desc">Grandmaster longevity: reserves 3×3/1×5 slots, runs killer stress checks &amp; live preview snap</string>
+    <string name="profile_survival_desc">Full Guide-depth survival: checks all 6 orders, reserves 3×3/1×5 slots &amp; paces drops cleanly</string>
     <string name="profile_speed_title">Fastest Speed</string>
-    <string name="profile_speed_desc">Sub-15 ms open-board solves, instant zero-pause pickups &amp; rapid 165 ms glides</string>
+    <string name="profile_speed_desc">Brisk full-order bitwise solves with calm animation waits &amp; verified drop accuracy</string>
     <string name="guided_cal_title">Guided 3-Point Preview Calibration</string>
     <string name="guided_cal_desc">Probes 3 board cells using the game\'s live ghost shadow, solves exact 4-parameter screen physics, and cancels cleanly without dropping a piece.</string>
     <string name="guided_cal_cta">Run Guided 3-Point Calibration</string>

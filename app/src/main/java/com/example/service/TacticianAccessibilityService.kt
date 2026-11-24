@@ -239,56 +239,44 @@ class TacticianAccessibilityService : AccessibilityService() {
             var consecutiveIdleFrames = 0
             var consecutiveErrors = 0
             var failedDropStreak = 0
+            var consecutiveNoMoveFrames = 0
             var hasVerifiedLayoutForSession = false
-            var carryoverFrame: CaptureAttempt.Frame? = null
-            var carryoverParsed: ParsedFrame.ActiveBoard? = null
+            var autoProbeTriedThisSession = false
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
                 if (state.status == ServiceStatus.PAUSED || state.status == ServiceStatus.STOPPED) {
-                    carryoverFrame = null
-                    carryoverParsed = null
                     delay(350L)
                     continue
                 }
 
-                val currentFrame: CaptureAttempt.Frame
-                var preParsedBoard: ParsedFrame? = null
-
-                if (carryoverFrame != null && carryoverParsed != null) {
-                    currentFrame = carryoverFrame
-                    preParsedBoard = carryoverParsed
-                    carryoverFrame = null
-                    carryoverParsed = null
-                } else {
-                    when (val cap = captureFrameViaAccessibility()) {
-                        is CaptureAttempt.Throttled -> {
-                            delay(340L)
-                            continue
+                val currentFrame: CaptureAttempt.Frame = when (val cap = captureFrameViaAccessibility()) {
+                    is CaptureAttempt.Throttled -> {
+                        delay(340L)
+                        continue
+                    }
+                    is CaptureAttempt.UnsupportedOrError -> {
+                        consecutiveErrors++
+                        if (consecutiveErrors >= 3) {
+                            OverlayStateStore.setPaused(
+                                true,
+                                "Accessibility screenshot unavailable — switch to MediaProjection fallback."
+                            )
+                            delay(500L)
+                        } else {
+                            delay(380L)
                         }
-                        is CaptureAttempt.UnsupportedOrError -> {
-                            consecutiveErrors++
-                            if (consecutiveErrors >= 3) {
-                                OverlayStateStore.setNotice(
-                                    "Accessibility screenshot unavailable — switch to MediaProjection fallback."
-                                )
-                                OverlayStateStore.setPaused(true)
-                                delay(500L)
-                            } else {
-                                delay(380L)
-                            }
-                            continue
-                        }
-                        is CaptureAttempt.Frame -> {
-                            consecutiveErrors = 0
-                            currentFrame = cap
-                        }
+                        continue
+                    }
+                    is CaptureAttempt.Frame -> {
+                        consecutiveErrors = 0
+                        cap
                     }
                 }
 
                 updateDisplayMetrics()
                 var activeConfig = state.roiConfig
-                var parsed = preParsedBoard ?: parser.parse(
+                var parsed = parser.parse(
                     frame = currentFrame.pixelFrame,
                     width = currentFrame.width,
                     height = currentFrame.height,
@@ -303,6 +291,10 @@ class TacticianAccessibilityService : AccessibilityService() {
                     screenChanged || (!hasVerifiedLayoutForSession && parsed is ParsedFrame.IdleOrMenu)
 
                 if (needsAutoLayout) {
+                    OverlayStateStore.setThought(
+                        "Detecting board & tray bounds…",
+                        "Adapting to ${screenWidthPx}×${screenHeightPx}"
+                    )
                     val detected = withContext(Dispatchers.Default) {
                         AutoLayoutCalibrator.detectBoardAndTrayLayout(
                             frame = currentFrame.pixelFrame,
@@ -341,27 +333,41 @@ class TacticianAccessibilityService : AccessibilityService() {
                             lockedRec = null
                             lockedActive = null
                             failedDropStreak = 0
+                            consecutiveNoMoveFrames = 0
+                            autoProbeTriedThisSession = false
                             OverlayStateStore.resetComboOnNewGame()
-                            OverlayStateStore.setSearching()
+                            OverlayStateStore.setSearching(
+                                "Watching for active Block Blast board…",
+                                "Waiting for gameplay screen"
+                            )
                         }
                         delay(420L)
                     }
                     is ParsedFrame.Animating -> {
                         consecutiveIdleFrames = 0
+                        OverlayStateStore.setSearching(
+                            "Waiting for board to settle cleanly…",
+                            "2-frame stability lock active"
+                        )
                         delay(340L)
                     }
                     is ParsedFrame.ActiveBoard -> {
                         consecutiveIdleFrames = 0
 
-                        // Check if user triggered Guided 3-Point Preview Calibration
-                        if (OverlayStateStore.state.value.pendingGuidedCalibration) {
+                        val shouldRunGuidedProbe = OverlayStateStore.state.value.pendingGuidedCalibration ||
+                            (activeConfig.operatingMode == OperatingMode.AUTOPLAY &&
+                                !activeConfig.isPreviewLocked &&
+                                !autoProbeTriedThisSession)
+
+                        if (shouldRunGuidedProbe) {
+                            autoProbeTriedThisSession = true
                             runGuidedPreviewCalibration(activeConfig, currentFrame, parsed)
                             lockedBoardMask = -1L
                             lockedTraySig = ""
                             lockedRec = null
                             lockedActive = null
                             parser.resetStability()
-                            delay(220L)
+                            delay(260L)
                             continue
                         }
 
@@ -379,8 +385,13 @@ class TacticianAccessibilityService : AccessibilityService() {
                         val recToUse: MoveRecommendation? = if (isSameBoard) {
                             lockedRec
                         } else {
-                            OverlayStateStore.setThinking(parsed.boardMask, parsed.emptyCellColorRgb)
+                            val filled = java.lang.Long.bitCount(parsed.boardMask)
                             val combo = OverlayStateStore.state.value.comboState
+                            OverlayStateStore.setThinking(
+                                boardMask = parsed.boardMask,
+                                themeRgb = parsed.emptyCellColorRgb,
+                                detail = "$filled/64 filled • ${profile.label} • Streak ${combo.comboStreak}"
+                            )
                             val solved = withContext(Dispatchers.Default) {
                                 BitboardSolver.solve(
                                     boardMask = parsed.boardMask,
@@ -404,9 +415,33 @@ class TacticianAccessibilityService : AccessibilityService() {
                             solved
                         }
 
+                        if (recToUse == null) {
+                            consecutiveNoMoveFrames++
+                            if (OverlayStateStore.state.value.roiConfig.operatingMode == OperatingMode.AUTOPLAY) {
+                                if (consecutiveNoMoveFrames >= 2) {
+                                    OverlayStateStore.setGameOverPaused(
+                                        message = "Game Over — no legal placements left",
+                                        detail = "Start a new game & tap Start to resume"
+                                    )
+                                } else {
+                                    OverlayStateStore.setThought(
+                                        "No legal placements seen ($consecutiveNoMoveFrames/2)…",
+                                        "Double-checking settled board"
+                                    )
+                                }
+                            }
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedRec = null
+                            lockedActive = null
+                            parser.resetStability()
+                            delay(420L)
+                            continue
+                        }
+
+                        consecutiveNoMoveFrames = 0
                         val currentState = OverlayStateStore.state.value
                         if (currentState.roiConfig.operatingMode == OperatingMode.AUTOPLAY &&
-                            recToUse != null &&
                             currentState.status != ServiceStatus.PAUSED &&
                             currentState.status != ServiceStatus.STOPPED
                         ) {
@@ -419,11 +454,12 @@ class TacticianAccessibilityService : AccessibilityService() {
                                 continue
                             }
 
-                            OverlayStateStore.setDragging(recToUse)
+                            OverlayStateStore.setDragging(
+                                recommendation = recToUse,
+                                detail = "${recToUse.piece.label} • ${(recToUse.monteCarloSurvivalRate * 100).toInt()}% safe"
+                            )
                             var dragConfig = OverlayStateStore.state.value.roiConfig
-                            val useLiveSnap = profile.enableLivePreviewSnap || !dragConfig.isPreviewLocked
-
-                            val dragOk = if (useLiveSnap) {
+                            val dragOk = if (profile.enableLivePreviewSnap) {
                                 performLivePreviewSnapDrop(
                                     config = dragConfig,
                                     rec = recToUse,
@@ -446,18 +482,23 @@ class TacticianAccessibilityService : AccessibilityService() {
 
                             if (!dragOk) {
                                 failedDropStreak++
-                                if (failedDropStreak >= 3) {
-                                    OverlayStateStore.setPaused(
-                                        true,
-                                        "Autoplay paused — touch gesture was interrupted."
-                                    )
-                                }
-                                delay(380L)
+                                OverlayStateStore.setThought(
+                                    "Drag gesture interrupted — re-settling…",
+                                    "Waiting cleanly before retry #$failedDropStreak"
+                                )
+                                lockedBoardMask = -1L
+                                lockedTraySig = ""
+                                lockedRec = null
+                                lockedActive = null
+                                parser.resetStability()
+                                delay(420L)
                                 continue
                             }
 
-                            // Verify-After-Drop closed-loop check + post-drop frame carryover
-                            OverlayStateStore.setVerifying()
+                            // Verify-After-Drop closed-loop check, then always re-verify 2-frame settle on next turn
+                            OverlayStateStore.setVerifying(
+                                detail = "Waiting ${profile.postDropWaitMs} ms for clear/spawn animations"
+                            )
                             delay(profile.postDropWaitMs)
                             parser.resetStability()
 
@@ -484,7 +525,8 @@ class TacticianAccessibilityService : AccessibilityService() {
                                             persistMovementCalibration(calUpdate.updatedConfig)
                                             OverlayStateStore.recordVerifiedMove(
                                                 calibrationSummary = calUpdate.summary,
-                                                linesCleared = verdict.linesCleared
+                                                linesCleared = verdict.linesCleared,
+                                                thoughtStatus = calUpdate.summary
                                             )
                                         } else {
                                             OverlayStateStore.recordVerifiedMove(
@@ -492,18 +534,19 @@ class TacticianAccessibilityService : AccessibilityService() {
                                                 linesCleared = verdict.linesCleared
                                             )
                                         }
-                                        // Carry settled frame straight into next solve cycle (0ms wait!)
-                                        carryoverFrame = settled.frame
-                                        carryoverParsed = settled.activeBoard
                                     }
                                     is DropVerificationResult.NewTurnSpawned -> {
                                         failedDropStreak = 0
                                         OverlayStateStore.recordVerifiedMove(
                                             calibrationSummary = null,
-                                            linesCleared = verdict.linesCleared
+                                            linesCleared = verdict.linesCleared,
+                                            thoughtStatus = "New 3-piece turn spawned — settling…",
+                                            thoughtDetail = if (verdict.linesCleared > 0) {
+                                                "Cleared ${verdict.linesCleared} line(s)"
+                                            } else {
+                                                "Preparing full 6-order solve"
+                                            }
                                         )
-                                        carryoverFrame = settled.frame
-                                        carryoverParsed = settled.activeBoard
                                     }
                                     is DropVerificationResult.NotApplied -> {
                                         failedDropStreak++
@@ -511,18 +554,34 @@ class TacticianAccessibilityService : AccessibilityService() {
                                             dragConfig,
                                             recToUse
                                         )
-                                        OverlayStateStore.updateRoiConfig(recovered)
-                                        persistMovementCalibration(recovered)
-                                        val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
-                                        if (failedDropStreak >= maxFailures) {
-                                            OverlayStateStore.setPaused(
-                                                true,
-                                                "Autoplay paused — run Guided 3-Point Calibration in Calibrate."
+                                        if (failedDropStreak >= 2) {
+                                            val unlocked = recovered.copy(isPreviewLocked = false)
+                                            OverlayStateStore.updateRoiConfig(unlocked)
+                                            persistMovementCalibration(unlocked)
+                                            autoProbeTriedThisSession = false
+                                            failedDropStreak = 0
+                                            OverlayStateStore.setThought(
+                                                "Drop missed twice — re-probing screen…",
+                                                "Running slow guided 3-point probe next"
+                                            )
+                                        } else {
+                                            OverlayStateStore.updateRoiConfig(recovered)
+                                            persistMovementCalibration(recovered)
+                                            OverlayStateStore.setThought(
+                                                "Drop didn't land — self-fixing offset…",
+                                                "Nudging lift & re-settling cleanly"
                                             )
                                         }
                                     }
                                 }
+                            } else {
+                                OverlayStateStore.setThought(
+                                    "Waiting for post-drop screen settle…",
+                                    "Resetting stability lock"
+                                )
                             }
+                            // Force full 2-frame settle confirmation before next move (matches Guide pace)
+                            parser.resetStability()
                             lockedBoardMask = -1L
                             lockedTraySig = ""
                             lockedRec = null
@@ -636,7 +695,10 @@ class TacticianAccessibilityService : AccessibilityService() {
     ) {
         val plan = PreviewHoverDetector.selectGuidedCalibrationPlan(parsed.boardMask, parsed.tray)
         if (plan == null) {
-            OverlayStateStore.finishGuidedCalibration("Need open cells on board for Guided Calibration.")
+            OverlayStateStore.finishGuidedCalibration(
+                summary = "Probe skipped — using post-drop self-fix",
+                detail = "Board too tight for 3-point probe"
+            )
             return
         }
 
@@ -662,17 +724,24 @@ class TacticianAccessibilityService : AccessibilityService() {
         val startX = firstEndpoints.startX
         val startY = firstEndpoints.startY
 
-        OverlayStateStore.setCalibratingStep(1, "Calibrating Point 1/${plan.anchors.size} (reading preview)…")
+        OverlayStateStore.setCalibratingStep(
+            step = 1,
+            notice = "Probing physics (1/${plan.anchors.size})…",
+            detail = "Testing ${plan.piece.label} gently at R${firstAnchor.first + 1},C${firstAnchor.second + 1}"
+        )
         val hold = performBeginHoldDrag(
             startX = startX,
             startY = startY,
             toX = firstEndpoints.endX,
             toY = firstEndpoints.endY,
-            pressMs = 45L,
-            glideMs = 240L
+            pressMs = 70L,
+            glideMs = 360L
         )
         if (hold == null) {
-            OverlayStateStore.finishGuidedCalibration("Guided Calibration canceled — touch interrupted.")
+            OverlayStateStore.finishGuidedCalibration(
+                summary = "Probe interrupted — continuing with self-fix",
+                detail = "Touch gesture cancelled"
+            )
             return
         }
 
@@ -683,8 +752,9 @@ class TacticianAccessibilityService : AccessibilityService() {
             for ((idx, anchor) in plan.anchors.withIndex()) {
                 if (idx > 0) {
                     OverlayStateStore.setCalibratingStep(
-                        idx + 1,
-                        "Calibrating Point ${idx + 1}/${plan.anchors.size} (measuring offset)…"
+                        step = idx + 1,
+                        notice = "Probing physics (${idx + 1}/${plan.anchors.size})…",
+                        detail = "Measuring ghost shadow at R${anchor.first + 1},C${anchor.second + 1}"
                     )
                     val ep = config.computeDragEndpoints(
                         slotIndex = plan.slotIndex,
@@ -695,16 +765,17 @@ class TacticianAccessibilityService : AccessibilityService() {
                         screenWidthPx = screenWidthPx,
                         screenHeightPx = screenHeightPx
                     )
-                    if (!performNudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 200L)) break
+                    if (!performNudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 280L)) break
                 }
 
-                // Wait out Android Accessibility screenshot rate-limit (~350ms) while holding piece open
+                // Wait calmly for the ghost shadow to render and clear Android screenshot cooldown
+                delay(180L)
                 val elapsed = SystemClock.elapsedRealtime() - lastCaptureMs
-                if (elapsed < 355L) delay(355L - elapsed)
+                if (elapsed < 420L) delay(420L - elapsed)
 
                 var hoverAttempt = captureFrameViaAccessibility()
                 if (hoverAttempt is CaptureAttempt.Throttled) {
-                    delay(260L)
+                    delay(280L)
                     hoverAttempt = captureFrameViaAccessibility()
                 }
                 if (hoverAttempt is CaptureAttempt.Frame) {
@@ -739,8 +810,8 @@ class TacticianAccessibilityService : AccessibilityService() {
             }
         } finally {
             // Slide safely back into the tray slot BEFORE releasing so Block Blast cancels without placing
-            performNudgeHoldDrag(hold, startX, startY, durationMs = 210L)
-            performReleaseHoldDrag(hold, settleMs = 45L)
+            performNudgeHoldDrag(hold, startX, startY, durationMs = 290L)
+            performReleaseHoldDrag(hold, settleMs = 75L)
         }
 
         val calUpdate = if (collectedSamples.size >= 2) {
@@ -757,10 +828,14 @@ class TacticianAccessibilityService : AccessibilityService() {
         if (calUpdate != null) {
             OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
             persistMovementCalibration(calUpdate.updatedConfig)
-            OverlayStateStore.finishGuidedCalibration(calUpdate.summary)
+            OverlayStateStore.finishGuidedCalibration(
+                summary = calUpdate.summary,
+                detail = "${collectedSamples.size}/${plan.anchors.size} anchors matched"
+            )
         } else {
             OverlayStateStore.finishGuidedCalibration(
-                "Need 2+ open preview spots to calibrate — pause & retry on cleaner board."
+                summary = "Probe faint — using post-drop self-fix",
+                detail = "Proceeding calmly with landing feedback"
             )
         }
     }

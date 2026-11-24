@@ -336,6 +336,31 @@ fun LaunchpadScreen(
                                     .padding(horizontal = 12.dp, vertical = 8.dp)
                             )
                         }
+                    } else if (isRunning) {
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = runtime.thoughtStatus,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                if (!runtime.thoughtDetail.isNullOrBlank()) {
+                                    Text(
+                                        text = runtime.thoughtDetail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = statusColor
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     // Active Move Telemetry Strip

@@ -16,11 +16,13 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -29,11 +31,13 @@ import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -314,21 +318,23 @@ fun BoardHighlightOverlay(runtimeState: OverlayRuntimeState) {
 }
 
 /**
- * Minimalist Material 3 Expressive floating control pill containing Start/Pause and Stop ONLY.
+ * Material 3 Expressive floating control pill containing Start/Pause, Stop, and an attached
+ * compact "Bot's Mind" live thought bar showing what the engine is thinking or calibrating.
  */
 @Composable
 fun FloatingControlPill(
-    status: ServiceStatus,
+    runtimeState: OverlayRuntimeState,
     onTogglePause: () -> Unit,
     onStop: () -> Unit,
     onDragDelta: (dx: Float, dy: Float) -> Unit,
     onDragEnd: () -> Unit
 ) {
     TacticianTheme(darkTheme = true) {
+        val status = runtimeState.status
         val isPaused = status == ServiceStatus.PAUSED
         val indicatorColor = when (status) {
             ServiceStatus.GUIDING, ServiceStatus.DRAGGING -> MintSurge
-            ServiceStatus.VERIFYING -> MintSurge.copy(alpha = 0.7f)
+            ServiceStatus.VERIFYING -> MintSurge.copy(alpha = 0.78f)
             ServiceStatus.CALIBRATING -> AmberPop
             ServiceStatus.THINKING -> Color(0xFF7B9DFF)
             ServiceStatus.SEARCHING -> Color(0xFF4D8DFF)
@@ -339,6 +345,7 @@ fun FloatingControlPill(
         Surface(
             modifier = Modifier
                 .padding(4.dp)
+                .widthIn(min = 216.dp, max = 292.dp)
                 .pointerInput(Unit) {
                     detectDragGestures(
                         onDragEnd = { onDragEnd() },
@@ -350,75 +357,150 @@ fun FloatingControlPill(
                     )
                 }
                 .testTag("floating_control_pill"),
-            shape = RoundedCornerShape(50),
-            color = SlateSurfaceDark.copy(alpha = 0.92f),
+            shape = RoundedCornerShape(22.dp),
+            color = SlateSurfaceDark.copy(alpha = 0.94f),
             border = BorderStroke(
                 width = 1.5.dp,
-                color = indicatorColor.copy(alpha = 0.55f)
+                color = indicatorColor.copy(alpha = 0.58f)
             ),
             shadowElevation = 10.dp,
             tonalElevation = 6.dp
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            Column(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                // Drag grip + status dot
-                Box(
-                    modifier = Modifier.padding(start = 2.dp),
-                    contentAlignment = Alignment.Center
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.DragIndicator,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
-                        modifier = Modifier.size(18.dp)
-                    )
+                    // Drag grip + status dot
                     Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .size(7.dp)
-                            .background(indicatorColor, CircleShape)
-                    )
-                }
-
-                // Start / Pause toggle (48dp touch target)
-                FilledIconButton(
-                    onClick = onTogglePause,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("pill_toggle_pause_button"),
-                    shape = CircleShape,
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = if (isPaused) MintSurge else MintSurgeContainer,
-                        contentColor = if (isPaused) OnMintSurge else MintSurge
-                    )
-                ) {
-                    Icon(
-                        imageVector = if (isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
-                        contentDescription = stringResource(
-                            if (isPaused) R.string.action_resume else R.string.action_pause
+                        modifier = Modifier.padding(start = 2.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.DragIndicator,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                            modifier = Modifier.size(18.dp)
                         )
-                    )
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(7.dp)
+                                .background(indicatorColor, CircleShape)
+                        )
+                    }
+
+                    // Start / Pause toggle (48dp touch target)
+                    FilledIconButton(
+                        onClick = onTogglePause,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("pill_toggle_pause_button"),
+                        shape = CircleShape,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = if (isPaused) MintSurge else MintSurgeContainer,
+                            contentColor = if (isPaused) OnMintSurge else MintSurge
+                        )
+                    ) {
+                        Icon(
+                            imageVector = if (isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
+                            contentDescription = stringResource(
+                                if (isPaused) R.string.action_resume else R.string.action_pause
+                            )
+                        )
+                    }
+
+                    // Stop button (48dp touch target)
+                    FilledIconButton(
+                        onClick = onStop,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("pill_stop_button"),
+                        shape = CircleShape,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = CoralPulseContainer,
+                            contentColor = CoralPulse
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Stop,
+                            contentDescription = stringResource(R.string.action_stop)
+                        )
+                    }
+
+                    // Compact status & calibration lock badge
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(start = 2.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        val phaseLabel = when (status) {
+                            ServiceStatus.STOPPED -> "OFFLINE"
+                            ServiceStatus.SEARCHING -> "SETTLING"
+                            ServiceStatus.THINKING -> "SOLVING"
+                            ServiceStatus.PAUSED -> "PAUSED"
+                            ServiceStatus.GUIDING -> "READY"
+                            ServiceStatus.DRAGGING -> "MOVING"
+                            ServiceStatus.VERIFYING -> "VERIFYING"
+                            ServiceStatus.CALIBRATING -> "PROBING"
+                        }
+                        Text(
+                            text = phaseLabel,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.ExtraBold),
+                            color = indicatorColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        val metaBadge = buildString {
+                            append(if (runtimeState.roiConfig.isPreviewLocked) "Locked" else "Probe")
+                            if (runtimeState.comboState.comboStreak > 0) {
+                                append(" • ×${runtimeState.comboState.comboStreak}")
+                            } else if (runtimeState.autoplayMovesCount > 0) {
+                                append(" • #${runtimeState.autoplayMovesCount}")
+                            }
+                        }
+                        Text(
+                            text = metaBadge,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
 
-                // Stop button (48dp touch target)
-                FilledIconButton(
-                    onClick = onStop,
+                HorizontalDivider(
+                    thickness = 1.dp,
+                    color = indicatorColor.copy(alpha = 0.24f)
+                )
+
+                // Attached compact "Bot's Mind" status bar
+                Column(
                     modifier = Modifier
-                        .size(48.dp)
-                        .testTag("pill_stop_button"),
-                    shape = CircleShape,
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = CoralPulseContainer,
-                        contentColor = CoralPulse
-                    )
+                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                        .testTag("pill_thought_status_bar"),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Stop,
-                        contentDescription = stringResource(R.string.action_stop)
+                    Text(
+                        text = runtimeState.thoughtStatus,
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White.copy(alpha = 0.95f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
+                    if (!runtimeState.thoughtDetail.isNullOrBlank()) {
+                        Text(
+                            text = runtimeState.thoughtDetail,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = indicatorColor.copy(alpha = 0.92f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
         }

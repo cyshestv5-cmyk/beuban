@@ -216,8 +216,7 @@ object AutoplayMoveVerifier {
     }
 
     /**
-     * Adjusts lift & horizontal offset slightly from a single live hover observation before release,
-     * keeping subsequent pieces even tighter on first arrival.
+     * Conservative damped hover refinement when explicitly called after a clean static probe.
      */
     fun adjustFromSingleHoverObservation(
         config: AdaptiveRoiConfig,
@@ -237,8 +236,8 @@ object AutoplayMoveVerifier {
                 dragCalibrationSamples = config.dragCalibrationSamples + 1
             )
         }
-        val newLift = (config.dragLiftOffsetCells - rowErr * 0.65f).coerceIn(-1.0f, 4.8f)
-        val newOffX = (config.dragHorizontalOffsetCells - colErr * 0.65f).coerceIn(-2.5f, 2.5f)
+        val newLift = (config.dragLiftOffsetCells - rowErr * 0.28f).coerceIn(-1.0f, 4.8f)
+        val newOffX = (config.dragHorizontalOffsetCells - colErr * 0.28f).coerceIn(-2.5f, 2.5f)
         return config.copy(
             dragLiftOffsetCells = newLift,
             dragHorizontalOffsetCells = newOffX,
@@ -250,7 +249,7 @@ object AutoplayMoveVerifier {
 
     /**
      * Measures exact landing error (rowError, colError) across the entire 8x8 board when no lines cleared,
-     * updating both static offsets and gain multipliers to eliminate multi-block overshoots.
+     * applying smooth damped NLMS corrections so calibration never oscillates on proven drops.
      */
     fun calibrateFromLandedPlacement(
         config: AdaptiveRoiConfig,
@@ -279,7 +278,7 @@ object AutoplayMoveVerifier {
                 updatedConfig = confirmed,
                 rowError = 0,
                 colError = 0,
-                summary = "Locked exact (${formatF(confirmed.dragLiftOffsetCells)}c, ${formatF(confirmed.dragVerticalGain)}x)"
+                summary = "Exact hit • Locked (${formatF(confirmed.dragLiftOffsetCells)}c, ${formatF(confirmed.dragVerticalGain)}x)"
             )
         }
 
@@ -326,21 +325,21 @@ object AutoplayMoveVerifier {
         var newGainX = config.dragHorizontalGain
 
         if (rowError != 0) {
-            // NLMS split between static lift offset and upward vertical travel gain
-            val liftCorrection = (-rowError) * 0.52f
-            val gainCorrection = (-rowError) * upwardTravelNorm * 0.095f * config.dragVerticalGain
+            // Smooth damped NLMS split avoids overcorrecting single-cell integer snaps
+            val liftCorrection = (-rowError) * 0.34f
+            val gainCorrection = (-rowError) * upwardTravelNorm * 0.06f * config.dragVerticalGain
             newLift = (config.dragLiftOffsetCells + liftCorrection).coerceIn(-1.0f, 4.8f)
             newGainY = (config.dragVerticalGain + gainCorrection).coerceIn(0.65f, 1.95f)
         }
 
         if (colError != 0) {
-            newOffX = (config.dragHorizontalOffsetCells - colError * 0.48f).coerceIn(-2.5f, 2.5f)
+            newOffX = (config.dragHorizontalOffsetCells - colError * 0.34f).coerceIn(-2.5f, 2.5f)
             val dx = endpoints.baseTargetX - endpoints.startX
             if (abs(dx) > endpoints.cellWidthPx * 1.1f) {
                 val cellErrorX = colError * endpoints.cellWidthPx
                 val gainXRatio = (dx - cellErrorX) / dx
                 val targetGainX = config.dragHorizontalGain / gainXRatio.coerceIn(0.65f, 1.45f)
-                newGainX = (config.dragHorizontalGain * 0.65f + targetGainX * 0.35f).coerceIn(0.65f, 1.45f)
+                newGainX = (config.dragHorizontalGain * 0.78f + targetGainX * 0.22f).coerceIn(0.65f, 1.45f)
             }
         }
 
@@ -357,30 +356,30 @@ object AutoplayMoveVerifier {
             updatedConfig = updated,
             rowError = rowError,
             colError = colError,
-            summary = "Calibrated Δr=$rowError,Δc=$colError → ${formatF(newLift)}c, ${formatF(newGainY)}x"
+            summary = "Self-fixed Δr=$rowError,Δc=$colError → ${formatF(newLift)}c, ${formatF(newGainY)}x"
         )
     }
 
     /**
-     * When a drag did not register (NotApplied), e.g., an upper-board placement overshot off Row 0,
-     * backs off upward travel so the retry lands cleanly inside the board.
+     * Mild backoff when a drag did not register; repeated misses trigger a fresh slow guided probe
+     * instead of large blind jumps.
      */
     fun recoverFromFailedDrop(
         config: AdaptiveRoiConfig,
         executed: MoveRecommendation
     ): AdaptiveRoiConfig {
-        return if (executed.targetRow <= 4) {
+        return if (executed.targetRow <= 3) {
             config.copy(
-                dragVerticalGain = (config.dragVerticalGain + 0.09f).coerceIn(0.65f, 1.95f),
-                dragLiftOffsetCells = (config.dragLiftOffsetCells + 0.55f).coerceIn(-1.0f, 4.8f)
+                dragVerticalGain = (config.dragVerticalGain + 0.04f).coerceIn(0.65f, 1.95f),
+                dragLiftOffsetCells = (config.dragLiftOffsetCells + 0.25f).coerceIn(-1.0f, 4.8f)
             )
         } else if (config.dragLiftOffsetCells > 2.6f) {
             config.copy(
-                dragLiftOffsetCells = (config.dragLiftOffsetCells - 0.35f).coerceIn(-1.0f, 4.8f)
+                dragLiftOffsetCells = (config.dragLiftOffsetCells - 0.20f).coerceIn(-1.0f, 4.8f)
             )
         } else {
             config.copy(
-                dragVerticalGain = (config.dragVerticalGain + 0.05f).coerceIn(0.65f, 1.95f)
+                dragVerticalGain = (config.dragVerticalGain + 0.03f).coerceIn(0.65f, 1.95f)
             )
         }
     }

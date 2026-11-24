@@ -77,6 +77,8 @@ object PreviewHoverDetector {
         return null
     }
 
+    private data class CellPatch(val meanRgb: Int, val maxSpread: Int)
+
     /**
      * Captures the 64 board cell center mean RGB values prior to starting a drag gesture.
      */
@@ -96,7 +98,7 @@ object PreviewHoverDetector {
             val cy = (config.cellCenterY(r) * height).roundToInt()
             for (c in 0 until 8) {
                 val cx = (config.cellCenterX(c) * width).roundToInt()
-                baselines[r * 8 + c] = sampleMeanRgb(frame, width, height, cx, cy, dx, dy)
+                baselines[r * 8 + c] = samplePatch(frame, width, height, cx, cy, dx, dy).meanRgb
             }
         }
         return baselines
@@ -104,7 +106,7 @@ object PreviewHoverDetector {
 
     /**
      * Matches the currently hovered ghost preview shadow on the 8x8 board against every legal
-     * placement of [piece] on [preBoardMask].
+     * placement of [piece] on [preBoardMask], filtering non-uniform floating tile sprites.
      */
     fun detectHoveredPreview(
         hoverFrame: PixelFrame,
@@ -125,7 +127,6 @@ object PreviewHoverDetector {
         val cellSignal = FloatArray(64)
         val cellChanged = BooleanArray(64)
         var changedEmptyCount = 0
-        var emptySignalSum = 0f
 
         for (r in 0 until 8) {
             val cy = (config.cellCenterY(r) * height).roundToInt()
@@ -134,7 +135,8 @@ object PreviewHoverDetector {
                 if (((preBoardMask ushr idx) and 1L) != 0L) continue
 
                 val cx = (config.cellCenterX(c) * width).roundToInt()
-                val curRgb = sampleMeanRgb(hoverFrame, width, height, cx, cy, dx, dy)
+                val patch = samplePatch(hoverFrame, width, height, cx, cy, dx, dy)
+                val curRgb = patch.meanRgb
                 val baseRgb = preCellColors[idx]
 
                 val rgbDist = AdaptiveScreenParser.rgbDistance(curRgb, baseRgb)
@@ -147,11 +149,17 @@ object PreviewHoverDetector {
                         AdaptiveScreenParser.saturationOf(baseRgb)
                 )
 
-                // Combine chromatic and brightness shift caused by semi-transparent preview tiles
-                val combined = rgbDist * 0.65f + lumDelta * 0.55f + satDelta * 65f
+                // Uniform ghost shadows vary smoothly inside cell centers; crisp dragged sprite edges have high spread
+                val uniformityWeight = when {
+                    patch.maxSpread <= 38 -> 1.0f
+                    patch.maxSpread <= 68 -> 0.60f
+                    else -> 0.20f
+                }
+
+                val combined = (rgbDist * 0.65f + lumDelta * 0.55f + satDelta * 65f) * uniformityWeight
                 cellSignal[idx] = combined
-                emptySignalSum += combined
-                if (rgbDist >= 15f || lumDelta >= 12f || satDelta >= 0.08f) {
+                val hasDelta = rgbDist >= 15f || lumDelta >= 12f || satDelta >= 0.08f
+                if (hasDelta && patch.maxSpread <= 72) {
                     cellChanged[idx] = true
                     changedEmptyCount++
                 }
@@ -167,7 +175,7 @@ object PreviewHoverDetector {
         val masks = piece.placementMasks
         val rows = piece.placementRows
         val cols = piece.placementCols
-        val minRequiredHits = if (piece.cellCount <= 2) piece.cellCount else max(2, piece.cellCount - 1)
+        val minRequiredHits = if (piece.cellCount <= 4) piece.cellCount else max(3, piece.cellCount - 1)
 
         for (i in 0 until piece.placementCount) {
             val pm = masks[i]
@@ -186,8 +194,8 @@ object PreviewHoverDetector {
             if (hits < minRequiredHits) continue
 
             val outsideChanged = max(0, changedEmptyCount - hits)
-            val precisionPenalty = outsideChanged * 0.68f
-            val coverageBonus = (hits.toFloat() / piece.cellCount) * 1.35f
+            val precisionPenalty = outsideChanged * 0.72f
+            val coverageBonus = (hits.toFloat() / piece.cellCount) * 1.40f
             val score = footprintSignal + coverageBonus - precisionPenalty
 
             if (score > bestScore) {
@@ -199,13 +207,13 @@ object PreviewHoverDetector {
 
         if (bestIdx < 0) return null
 
-        val expectedMinScore = piece.cellCount * 0.42f
+        val expectedMinScore = piece.cellCount * 0.48f
         if (bestScore < expectedMinScore) return null
 
         val recall = bestHits.toFloat() / piece.cellCount
         val precision = bestHits.toFloat() / max(bestHits, changedEmptyCount)
         val confidence = ((recall * 0.6f + precision * 0.4f)).coerceIn(0f, 1f)
-        if (confidence < 0.45f) return null
+        if (confidence < 0.56f) return null
 
         return PreviewHoverMatch(
             row = rows[bestIdx],
@@ -216,7 +224,7 @@ object PreviewHoverDetector {
         )
     }
 
-    private fun sampleMeanRgb(
+    private fun samplePatch(
         frame: PixelFrame,
         width: Int,
         height: Int,
@@ -224,25 +232,42 @@ object PreviewHoverDetector {
         cy: Int,
         dx: Int,
         dy: Int
-    ): Int {
+    ): CellPatch {
         var sumR = 0
         var sumG = 0
         var sumB = 0
+        var minR = 255
+        var maxR = 0
+        var minG = 255
+        var maxG = 0
+        var minB = 255
+        var maxB = 0
         var count = 0
         for (oy in -1..1) {
             val py = (cy + oy * dy).coerceIn(0, height - 1)
             for (ox in -1..1) {
                 val px = (cx + ox * dx).coerceIn(0, width - 1)
                 val rgb = frame.pixelAt(px, py)
-                sumR += (rgb ushr 16) and 0xFF
-                sumG += (rgb ushr 8) and 0xFF
-                sumB += rgb and 0xFF
+                val r = (rgb ushr 16) and 0xFF
+                val g = (rgb ushr 8) and 0xFF
+                val b = rgb and 0xFF
+                sumR += r
+                sumG += g
+                sumB += b
+                if (r < minR) minR = r
+                if (r > maxR) maxR = r
+                if (g < minG) minG = g
+                if (g > maxG) maxG = g
+                if (b < minB) minB = b
+                if (b > maxB) maxB = b
                 count++
             }
         }
-        return (0xFF shl 24) or
+        val meanRgb = (0xFF shl 24) or
             ((sumR / count) shl 16) or
             ((sumG / count) shl 8) or
             (sumB / count)
+        val spread = max(maxR - minR, max(maxG - minG, maxB - minB))
+        return CellPatch(meanRgb = meanRgb, maxSpread = spread)
     }
 }

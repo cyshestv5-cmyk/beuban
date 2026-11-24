@@ -175,18 +175,18 @@ object BitboardSolver {
             BoardTier.CRITICAL -> effectiveProfile.criticalBudgetMs
         }
         val budgetNs = budgetMs * 1_000_000L
-        val searchSoftDeadlineNs = startNs + (budgetNs * 44L) / 100L
+        val searchBudgetNs = (budgetNs * 52L) / 100L
         val totalDeadlineNs = startNs + budgetNs
 
         val branchCapDepth0 = when (tier) {
-            BoardTier.CRITICAL -> 40
-            BoardTier.CONTESTED -> 26
-            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 12 else 18
+            BoardTier.CRITICAL -> 44
+            BoardTier.CONTESTED -> 34
+            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 22 else 28
         }
         val branchCapDepth1 = when (tier) {
-            BoardTier.CRITICAL -> 28
-            BoardTier.CONTESTED -> 18
-            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 10 else 14
+            BoardTier.CRITICAL -> 30
+            BoardTier.CONTESTED -> 24
+            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 16 else 20
         }
 
         val initialCombo = ComboState(comboStreak = comboStreak, placementsSinceClear = placementsSinceClear)
@@ -195,10 +195,10 @@ object BitboardSolver {
         // Transposition tables indexed by 3-bit placed-slot mask (0..7)
         val transTables = Array(8) { PrimitiveTranspositionTable(512) }
 
-        val perPermBudgetNs = max(2_500_000L, (budgetNs * 44L) / (100L * permutations.size))
+        // Always give every permutation its dedicated slice so piece orderings are never skipped
+        val perPermBudgetNs = max(8_000_000L, searchBudgetNs / max(1, permutations.size))
         for (perm in permutations) {
-            if (candidates.isNotEmpty() && System.nanoTime() > searchSoftDeadlineNs) break
-            val permDeadlineNs = min(searchSoftDeadlineNs, System.nanoTime() + perPermBudgetNs)
+            val permDeadlineNs = System.nanoTime() + perPermBudgetNs
             val stepBuf = arrayOfNulls<PlannedPlacement>(perm.size)
             searchPermutation(
                 board = boardMask,
@@ -246,9 +246,9 @@ object BitboardSolver {
         // Deduplicate by (first move + endBoard) so rollouts spend cycles on distinct outcomes
         candidates.sortByDescending { it.heuristicScore }
         val maxRolloutCandidates = when (tier) {
-            BoardTier.CRITICAL -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 10 else 28
-            BoardTier.CONTESTED -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 8 else 18
-            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 4 else 8
+            BoardTier.CRITICAL -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 14 else 28
+            BoardTier.CONTESTED -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 12 else 20
+            BoardTier.OPEN -> if (effectiveProfile == GlobalProfile.FASTEST_SPEED) 8 else 14
         }
         val uniqueCandidates = ArrayList<CandidatePlan>(maxRolloutCandidates)
         val seenKeys = HashSet<DedupKey>(maxRolloutCandidates * 2)
@@ -273,10 +273,10 @@ object BitboardSolver {
         var bestBulkyCount = 0
 
         for ((index, cand) in uniqueCandidates.withIndex()) {
-            if (index >= 3 && System.nanoTime() >= totalDeadlineNs) break
+            if (index >= 4 && System.nanoTime() >= totalDeadlineNs) break
 
             val bulkyCount = countBulkyPlacementsFast(cand.endBoard)
-            val killerRate = if (tier != BoardTier.OPEN || effectiveProfile != GlobalProfile.FASTEST_SPEED) {
+            val killerRate = if (effectiveProfile != GlobalProfile.FASTEST_SPEED || tier != BoardTier.OPEN) {
                 evaluateKillerReserveRate(cand.endBoard)
             } else {
                 0.5f
@@ -286,7 +286,7 @@ object BitboardSolver {
                 endCombo = ComboState(cand.endComboStreak, cand.endPlacementsSinceClear),
                 mode = effectiveMode,
                 draws = rolloutDraws,
-                includeQualityFollowup = (tier != BoardTier.OPEN || effectiveProfile != GlobalProfile.FASTEST_SPEED)
+                includeQualityFollowup = (effectiveProfile != GlobalProfile.FASTEST_SPEED || tier != BoardTier.OPEN)
             )
 
             val survivalWeight = when (effectiveMode) {
@@ -498,7 +498,10 @@ object BitboardSolver {
 
             // Transposition check on intermediate depths (avoid re-expanding identical board + placed-slot sets)
             if (!isLeaf && nextPlacedMask in 1..6) {
-                val runningScore = (totalLines + lines) * 20f + multiBonus + multi + nextCombo.comboStreak * 8f -
+                val comboTerm = (if (lostStreak) -140f else 0f) +
+                    (if (nextCombo.placementsSinceClear == 0) 24f else 0f)
+                val runningScore = (totalLines + lines) * 20f + multiBonus + multi +
+                    nextCombo.comboStreak * 8f + comboTerm -
                     java.lang.Long.bitCount(nextBoard) * 1.2f
                 if (!transTables[nextPlacedMask].shouldExpand(nextBoard, runningScore)) {
                     continue

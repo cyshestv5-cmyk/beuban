@@ -819,4 +819,106 @@ class VisionAndSolverTest {
             assertEquals("Col should snap exact after 3-point preview lock", target.second, landedCol)
         }
     }
+
+    @Test
+    fun `preview hover detector rejects sharp non-uniform floating sprite edges`() {
+        val img = ImageIO.read(resolveAttachment("Screenshot_20261123_235903_com_blockblast_lite_AppActivity_f51f6358.jpg"))
+        val w = img.width
+        val h = img.height
+        val rawPixels = img.getRGB(0, 0, w, h, null, 0, w)
+        val cfg = AdaptiveRoiConfig()
+
+        val baseFrame = IntArrayPixelFrame(rawPixels, w, h)
+        val parsed = AdaptiveScreenParser().parse(baseFrame, w, h, cfg, requireStability = false) as ParsedFrame.ActiveBoard
+        val baselines = PreviewHoverDetector.captureCellBaselines(baseFrame, w, h, cfg)
+
+        // Inject high-contrast checkerboard sprite edges over (2, 2) without a uniform ghost fill
+        val noisyPixels = rawPixels.copyOf()
+        val sq2x2 = PieceCatalog.BY_ID.getValue("sq_2x2")
+        val cellWPx = cfg.cellWidth() * w
+        val cellHPx = cfg.cellHeight() * h
+        for ((dr, dc) in sq2x2.cells()) {
+            val cx = (cfg.cellCenterX(2 + dc) * w).toInt()
+            val cy = (cfg.cellCenterY(2 + dr) * h).toInt()
+            val hw = (cellWPx * 0.25f).toInt()
+            val hh = (cellHPx * 0.25f).toInt()
+            for (y in (cy - hh)..(cy + hh)) {
+                for (x in (cx - hw)..(cx + hw)) {
+                    noisyPixels[y * w + x] = if (((x + y) and 1) == 0) 0xFFFFFFFF.toInt() else 0xFF101010.toInt()
+                }
+            }
+        }
+
+        val rejected = PreviewHoverDetector.detectHoveredPreview(
+            hoverFrame = IntArrayPixelFrame(noisyPixels, w, h),
+            width = w,
+            height = h,
+            config = cfg,
+            preBoardMask = parsed.boardMask,
+            preCellColors = baselines,
+            piece = sq2x2
+        )
+        assertNull("Sharp checkerboard sprite edge noise should not false-trigger preview match", rejected)
+    }
+
+    @Test
+    fun `overlay state store tracks live bot mind thoughts and pauses cleanly on game over`() {
+        val store = com.example.data.OverlayStateStore
+        store.setServiceStarted(1080, 2400, com.example.data.CaptureSource.ACCESSIBILITY)
+        assertTrue(store.state.value.thoughtStatus.contains("Watching", ignoreCase = true))
+
+        store.setThinking(0xFFL, 0xFF1E2233.toInt(), detail = "8/64 filled • Max Survival")
+        assertTrue(store.state.value.thoughtStatus.contains("6 piece orders", ignoreCase = true))
+        assertEquals("8/64 filled • Max Survival", store.state.value.thoughtDetail)
+
+        val dot = PieceCatalog.BY_ID.getValue("dot_1x1")
+        val rec = MoveRecommendation(
+            slotIndex = 1,
+            piece = dot,
+            targetRow = 3,
+            targetCol = 4,
+            linesCleared = 1,
+            fullPlan = emptyList(),
+            survivabilityScore = 120f,
+            bulkyCapacityScore = 12,
+            monteCarloSurvivalRate = 0.96f,
+            solveTimeMs = 42L
+        )
+        store.updateGuidance(0xFFL, 0xFF1E2233.toInt(), rec)
+        assertTrue(store.state.value.thoughtStatus.contains("Slot 2"))
+        assertTrue(store.state.value.thoughtDetail!!.contains("96% safe"))
+
+        store.setDragging(rec)
+        assertTrue(store.state.value.thoughtStatus.contains("Moving Slot 2"))
+
+        store.recordVerifiedMove(calibrationSummary = "Exact hit • Locked (1.8c, 1.15x)", linesCleared = 1)
+        assertEquals(1, store.state.value.autoplayMovesCount)
+        assertEquals(1, store.state.value.comboState.comboStreak)
+
+        store.setGameOverPaused("Game Over — no legal placements left")
+        assertEquals(com.example.data.ServiceStatus.PAUSED, store.state.value.status)
+        assertEquals("Game Over — no legal placements left", store.state.value.thoughtStatus)
+
+        store.setStopped()
+        assertEquals(com.example.data.ServiceStatus.STOPPED, store.state.value.status)
+        assertEquals("Engine idle — ready", store.state.value.thoughtStatus)
+    }
+
+    @Test
+    fun `all global profiles disable erratic mid-drag snap and open board plan reuse`() {
+        for (profile in GlobalProfile.entries) {
+            assertTrue(
+                "Profile ${profile.name} should disable mid-drag snap corruption",
+                !profile.enableLivePreviewSnap
+            )
+            assertTrue(
+                "Profile ${profile.name} should disable open-board plan reuse",
+                !profile.allowOpenBoardPlanReuse
+            )
+            assertTrue(
+                "Profile ${profile.name} postDropWaitMs should allow calm animations (>=300ms)",
+                profile.postDropWaitMs >= 300L
+            )
+        }
+    }
 }

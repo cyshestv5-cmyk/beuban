@@ -94,7 +94,7 @@ class OverlayWindowHost(
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = (screenWidthPx * 0.04f).roundToInt()
-            y = (screenHeightPx * 0.12f).roundToInt()
+            y = (screenHeightPx * 0.055f).roundToInt()
         }
 
         val pillView = ComposeView(context).apply {
@@ -104,12 +104,12 @@ class OverlayWindowHost(
             setContent {
                 val state by OverlayStateStore.state.collectAsState()
                 FloatingControlPill(
-                    status = state.status,
+                    runtimeState = state,
                     onTogglePause = onTogglePause,
                     onStop = onStop,
                     onDragDelta = { dx, dy ->
                         pParams.x = (pParams.x + dx.roundToInt()).coerceIn(0, max(0, screenWidthPx - width))
-                        pParams.y = (pParams.y + dy.roundToInt()).coerceIn(64, max(64, screenHeightPx - height))
+                        pParams.y = (pParams.y + dy.roundToInt()).coerceIn(48, max(48, screenHeightPx - height))
                         try {
                             wm.updateViewLayout(this, pParams)
                         } catch (_: IllegalArgumentException) {

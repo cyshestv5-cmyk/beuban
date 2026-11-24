@@ -267,15 +267,13 @@ class ScreenCaptureService : Service() {
             var lockedActive: ParsedFrame.ActiveBoard? = null
             var consecutiveIdleFrames = 0
             var failedDropStreak = 0
+            var consecutiveNoMoveFrames = 0
             var hasVerifiedLayoutForSession = false
-            var carryoverBoard: ParsedFrame.ActiveBoard? = null
-            var carryoverBaselines: IntArray? = null
+            var autoProbeTriedThisSession = false
 
             while (isActive) {
                 val state = OverlayStateStore.state.value
                 if (state.status == ServiceStatus.PAUSED || !isContentVisible) {
-                    carryoverBoard = null
-                    carryoverBaselines = null
                     delay(IDLE_POLL_MS)
                     continue
                 }
@@ -286,34 +284,24 @@ class ScreenCaptureService : Service() {
                     activeConfig.calibratedScreenWidthPx != screenWidthPx ||
                         activeConfig.calibratedScreenHeightPx != screenHeightPx
 
-                val parsed: ParsedFrame
-                var preCellColors: IntArray? = null
-
-                if (carryoverBoard != null && !screenChanged) {
-                    parsed = carryoverBoard
-                    preCellColors = carryoverBaselines
-                    carryoverBoard = null
-                    carryoverBaselines = null
-                } else {
-                    val acquired = acquireParsedFrameWithAutoLayout(
-                        config = activeConfig,
-                        requireStability = true,
-                        allowAutoLayout = screenChanged || !hasVerifiedLayoutForSession
-                    )
-                    if (acquired == null) {
-                        delay(ACTIVE_POLL_MS)
-                        continue
-                    }
-                    parsed = acquired.parsed
-                    preCellColors = acquired.preCellColors
-                    if (acquired.updatedConfig != null) {
-                        activeConfig = acquired.updatedConfig
-                        hasVerifiedLayoutForSession = true
-                        OverlayStateStore.updateRoiConfig(acquired.updatedConfig)
-                        persistLayoutCalibration(acquired.updatedConfig)
-                    } else if (parsed is ParsedFrame.ActiveBoard) {
-                        hasVerifiedLayoutForSession = true
-                    }
+                val acquired = acquireParsedFrameWithAutoLayout(
+                    config = activeConfig,
+                    requireStability = true,
+                    allowAutoLayout = screenChanged || !hasVerifiedLayoutForSession
+                )
+                if (acquired == null) {
+                    delay(ACTIVE_POLL_MS)
+                    continue
+                }
+                val parsed = acquired.parsed
+                val preCellColors = acquired.preCellColors
+                if (acquired.updatedConfig != null) {
+                    activeConfig = acquired.updatedConfig
+                    hasVerifiedLayoutForSession = true
+                    OverlayStateStore.updateRoiConfig(acquired.updatedConfig)
+                    persistLayoutCalibration(acquired.updatedConfig)
+                } else if (parsed is ParsedFrame.ActiveBoard) {
+                    hasVerifiedLayoutForSession = true
                 }
 
                 when (parsed) {
@@ -326,25 +314,40 @@ class ScreenCaptureService : Service() {
                             lockedRec = null
                             lockedActive = null
                             failedDropStreak = 0
+                            consecutiveNoMoveFrames = 0
+                            autoProbeTriedThisSession = false
                             OverlayStateStore.resetComboOnNewGame()
-                            OverlayStateStore.setSearching()
+                            OverlayStateStore.setSearching(
+                                "Watching for active Block Blast board…",
+                                "Waiting for gameplay screen"
+                            )
                         }
                         delay(IDLE_POLL_MS)
                     }
                     is ParsedFrame.Animating -> {
                         consecutiveIdleFrames = 0
+                        OverlayStateStore.setSearching(
+                            "Waiting for board to settle cleanly…",
+                            "2-frame stability lock active"
+                        )
                         delay(ACTIVE_POLL_MS)
                     }
                     is ParsedFrame.ActiveBoard -> {
                         consecutiveIdleFrames = 0
 
-                        // Execute non-destructive Guided 3-Point Preview Calibration if armed
-                        if (OverlayStateStore.state.value.pendingGuidedCalibration) {
+                        val shouldRunGuidedProbe = OverlayStateStore.state.value.pendingGuidedCalibration ||
+                            (activeConfig.operatingMode == OperatingMode.AUTOPLAY &&
+                                !activeConfig.isPreviewLocked &&
+                                !autoProbeTriedThisSession)
+
+                        if (shouldRunGuidedProbe) {
+                            autoProbeTriedThisSession = true
                             if (TacticianAccessibilityService.isServiceConnected.value) {
                                 runGuidedPreviewCalibration(activeConfig, parsed, preCellColors)
                             } else {
                                 OverlayStateStore.finishGuidedCalibration(
-                                    "Enable Accessibility Service first so Guided Calibration can probe."
+                                    summary = "Accessibility needed for probe — using post-drop self-fix",
+                                    detail = "Grant Accessibility for automated dragging"
                                 )
                             }
                             lockedBoardMask = -1L
@@ -352,7 +355,7 @@ class ScreenCaptureService : Service() {
                             lockedRec = null
                             lockedActive = null
                             parser.resetStability()
-                            delay(200L)
+                            delay(240L)
                             continue
                         }
 
@@ -370,8 +373,13 @@ class ScreenCaptureService : Service() {
                         val recToUse: MoveRecommendation? = if (isUnchanged) {
                             lockedRec
                         } else {
-                            OverlayStateStore.setThinking(parsed.boardMask, parsed.emptyCellColorRgb)
+                            val filled = java.lang.Long.bitCount(parsed.boardMask)
                             val combo = OverlayStateStore.state.value.comboState
+                            OverlayStateStore.setThinking(
+                                boardMask = parsed.boardMask,
+                                themeRgb = parsed.emptyCellColorRgb,
+                                detail = "$filled/64 filled • ${profile.label} • Streak ${combo.comboStreak}"
+                            )
                             val rec = withContext(Dispatchers.Default) {
                                 BitboardSolver.solve(
                                     boardMask = parsed.boardMask,
@@ -395,9 +403,33 @@ class ScreenCaptureService : Service() {
                             rec
                         }
 
+                        if (recToUse == null) {
+                            consecutiveNoMoveFrames++
+                            if (OverlayStateStore.state.value.roiConfig.operatingMode == OperatingMode.AUTOPLAY) {
+                                if (consecutiveNoMoveFrames >= 2) {
+                                    OverlayStateStore.setGameOverPaused(
+                                        message = "Game Over — no legal placements left",
+                                        detail = "Start a new game & tap Start to resume"
+                                    )
+                                } else {
+                                    OverlayStateStore.setThought(
+                                        "No legal placements seen ($consecutiveNoMoveFrames/2)…",
+                                        "Double-checking settled board"
+                                    )
+                                }
+                            }
+                            lockedBoardMask = -1L
+                            lockedTraySig = ""
+                            lockedRec = null
+                            lockedActive = null
+                            parser.resetStability()
+                            delay(340L)
+                            continue
+                        }
+
+                        consecutiveNoMoveFrames = 0
                         val currentState = OverlayStateStore.state.value
                         if (currentState.roiConfig.operatingMode == OperatingMode.AUTOPLAY &&
-                            recToUse != null &&
                             TacticianAccessibilityService.isServiceConnected.value &&
                             currentState.status != ServiceStatus.PAUSED &&
                             currentState.status != ServiceStatus.STOPPED
@@ -411,13 +443,14 @@ class ScreenCaptureService : Service() {
                                 continue
                             }
 
-                            OverlayStateStore.setDragging(recToUse)
+                            OverlayStateStore.setDragging(
+                                recommendation = recToUse,
+                                detail = "${recToUse.piece.label} • ${(recToUse.monteCarloSurvivalRate * 100).toInt()}% safe"
+                            )
                             var dragConfig = OverlayStateStore.state.value.roiConfig
                             val baselines = preCellColors
-                            val useLiveSnap = (profile.enableLivePreviewSnap || !dragConfig.isPreviewLocked) &&
-                                baselines != null
 
-                            val dragOk = if (useLiveSnap && baselines != null) {
+                            val dragOk = if (profile.enableLivePreviewSnap && baselines != null) {
                                 performLivePreviewSnapDrop(
                                     config = dragConfig,
                                     rec = recToUse,
@@ -440,17 +473,22 @@ class ScreenCaptureService : Service() {
 
                             if (!dragOk) {
                                 failedDropStreak++
-                                if (failedDropStreak >= 3) {
-                                    OverlayStateStore.setPaused(
-                                        true,
-                                        "Autoplay paused — touch gesture was interrupted."
-                                    )
-                                }
-                                delay(320L)
+                                OverlayStateStore.setThought(
+                                    "Drag gesture interrupted — re-settling…",
+                                    "Waiting cleanly before retry #$failedDropStreak"
+                                )
+                                lockedBoardMask = -1L
+                                lockedTraySig = ""
+                                lockedRec = null
+                                lockedActive = null
+                                parser.resetStability()
+                                delay(360L)
                                 continue
                             }
 
-                            OverlayStateStore.setVerifying()
+                            OverlayStateStore.setVerifying(
+                                detail = "Waiting ${profile.postDropWaitMs} ms for clear/spawn animations"
+                            )
                             delay(profile.postDropWaitMs)
                             parser.resetStability()
 
@@ -478,7 +516,8 @@ class ScreenCaptureService : Service() {
                                             persistMovementCalibration(calUpdate.updatedConfig)
                                             OverlayStateStore.recordVerifiedMove(
                                                 calibrationSummary = calUpdate.summary,
-                                                linesCleared = verdict.linesCleared
+                                                linesCleared = verdict.linesCleared,
+                                                thoughtStatus = calUpdate.summary
                                             )
                                         } else {
                                             OverlayStateStore.recordVerifiedMove(
@@ -486,17 +525,19 @@ class ScreenCaptureService : Service() {
                                                 linesCleared = verdict.linesCleared
                                             )
                                         }
-                                        carryoverBoard = postBoard
-                                        carryoverBaselines = settled.second
                                     }
                                     is DropVerificationResult.NewTurnSpawned -> {
                                         failedDropStreak = 0
                                         OverlayStateStore.recordVerifiedMove(
                                             calibrationSummary = null,
-                                            linesCleared = verdict.linesCleared
+                                            linesCleared = verdict.linesCleared,
+                                            thoughtStatus = "New 3-piece turn spawned — settling…",
+                                            thoughtDetail = if (verdict.linesCleared > 0) {
+                                                "Cleared ${verdict.linesCleared} line(s)"
+                                            } else {
+                                                "Preparing full 6-order solve"
+                                            }
                                         )
-                                        carryoverBoard = postBoard
-                                        carryoverBaselines = settled.second
                                     }
                                     is DropVerificationResult.NotApplied -> {
                                         failedDropStreak++
@@ -504,18 +545,33 @@ class ScreenCaptureService : Service() {
                                             dragConfig,
                                             recToUse
                                         )
-                                        OverlayStateStore.updateRoiConfig(recovered)
-                                        persistMovementCalibration(recovered)
-                                        val maxFailures = if (dragConfig.dragCalibrationSamples < 2) 4 else 3
-                                        if (failedDropStreak >= maxFailures) {
-                                            OverlayStateStore.setPaused(
-                                                true,
-                                                "Autoplay paused — run Guided 3-Point Calibration in Calibrate."
+                                        if (failedDropStreak >= 2) {
+                                            val unlocked = recovered.copy(isPreviewLocked = false)
+                                            OverlayStateStore.updateRoiConfig(unlocked)
+                                            persistMovementCalibration(unlocked)
+                                            autoProbeTriedThisSession = false
+                                            failedDropStreak = 0
+                                            OverlayStateStore.setThought(
+                                                "Drop missed twice — re-probing screen…",
+                                                "Running slow guided 3-point probe next"
+                                            )
+                                        } else {
+                                            OverlayStateStore.updateRoiConfig(recovered)
+                                            persistMovementCalibration(recovered)
+                                            OverlayStateStore.setThought(
+                                                "Drop didn't land — self-fixing offset…",
+                                                "Nudging lift & re-settling cleanly"
                                             )
                                         }
                                     }
                                 }
+                            } else {
+                                OverlayStateStore.setThought(
+                                    "Waiting for post-drop screen settle…",
+                                    "Resetting stability lock"
+                                )
                             }
+                            parser.resetStability()
                             lockedBoardMask = -1L
                             lockedTraySig = ""
                             lockedRec = null
@@ -606,7 +662,10 @@ class ScreenCaptureService : Service() {
     ) {
         val plan = PreviewHoverDetector.selectGuidedCalibrationPlan(parsed.boardMask, parsed.tray)
         if (plan == null) {
-            OverlayStateStore.finishGuidedCalibration("Need open cells on board for Guided Calibration.")
+            OverlayStateStore.finishGuidedCalibration(
+                summary = "Probe skipped — using post-drop self-fix",
+                detail = "Board too tight for 3-point probe"
+            )
             return
         }
 
@@ -619,7 +678,10 @@ class ScreenCaptureService : Service() {
             }
         }
         if (baselines == null) {
-            OverlayStateStore.finishGuidedCalibration("Unable to read frame for Guided Calibration.")
+            OverlayStateStore.finishGuidedCalibration(
+                summary = "Probe skipped — using post-drop self-fix",
+                detail = "Frame unavailable for probe"
+            )
             return
         }
 
@@ -636,17 +698,24 @@ class ScreenCaptureService : Service() {
         val startX = firstEndpoints.startX
         val startY = firstEndpoints.startY
 
-        OverlayStateStore.setCalibratingStep(1, "Calibrating Point 1/${plan.anchors.size} (reading preview)…")
+        OverlayStateStore.setCalibratingStep(
+            step = 1,
+            notice = "Probing physics (1/${plan.anchors.size})…",
+            detail = "Testing ${plan.piece.label} gently at R${firstAnchor.first + 1},C${firstAnchor.second + 1}"
+        )
         val hold = TacticianAccessibilityService.beginHoldDrag(
             startX = startX,
             startY = startY,
             toX = firstEndpoints.endX,
             toY = firstEndpoints.endY,
-            pressMs = 45L,
-            glideMs = 230L
+            pressMs = 70L,
+            glideMs = 360L
         )
         if (hold == null) {
-            OverlayStateStore.finishGuidedCalibration("Guided Calibration canceled — touch interrupted.")
+            OverlayStateStore.finishGuidedCalibration(
+                summary = "Probe interrupted — continuing with self-fix",
+                detail = "Touch gesture cancelled"
+            )
             return
         }
 
@@ -655,8 +724,9 @@ class ScreenCaptureService : Service() {
             for ((idx, anchor) in plan.anchors.withIndex()) {
                 if (idx > 0) {
                     OverlayStateStore.setCalibratingStep(
-                        idx + 1,
-                        "Calibrating Point ${idx + 1}/${plan.anchors.size} (measuring offset)…"
+                        step = idx + 1,
+                        notice = "Probing physics (${idx + 1}/${plan.anchors.size})…",
+                        detail = "Measuring ghost shadow at R${anchor.first + 1},C${anchor.second + 1}"
                     )
                     val ep = config.computeDragEndpoints(
                         slotIndex = plan.slotIndex,
@@ -667,10 +737,10 @@ class ScreenCaptureService : Service() {
                         screenWidthPx = screenWidthPx,
                         screenHeightPx = screenHeightPx
                     )
-                    if (!TacticianAccessibilityService.nudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 190L)) break
+                    if (!TacticianAccessibilityService.nudgeHoldDrag(hold, ep.endX, ep.endY, durationMs = 280L)) break
                 }
 
-                delay(65L)
+                delay(260L)
                 val snap = acquireSnapshotFrame(config)
                 if (snap != null) {
                     val match = withContext(Dispatchers.Default) {
@@ -702,8 +772,8 @@ class ScreenCaptureService : Service() {
                 }
             }
         } finally {
-            TacticianAccessibilityService.nudgeHoldDrag(hold, startX, startY, durationMs = 200L)
-            TacticianAccessibilityService.releaseHoldDrag(hold, settleMs = 45L)
+            TacticianAccessibilityService.nudgeHoldDrag(hold, startX, startY, durationMs = 290L)
+            TacticianAccessibilityService.releaseHoldDrag(hold, settleMs = 75L)
         }
 
         val calUpdate = if (collectedSamples.size >= 2) {
@@ -720,10 +790,14 @@ class ScreenCaptureService : Service() {
         if (calUpdate != null) {
             OverlayStateStore.updateRoiConfig(calUpdate.updatedConfig)
             persistMovementCalibration(calUpdate.updatedConfig)
-            OverlayStateStore.finishGuidedCalibration(calUpdate.summary)
+            OverlayStateStore.finishGuidedCalibration(
+                summary = calUpdate.summary,
+                detail = "${collectedSamples.size}/${plan.anchors.size} anchors matched"
+            )
         } else {
             OverlayStateStore.finishGuidedCalibration(
-                "Need 2+ open preview spots to calibrate — pause & retry on cleaner board."
+                summary = "Probe faint — using post-drop self-fix",
+                detail = "Proceeding calmly with landing feedback"
             )
         }
     }
